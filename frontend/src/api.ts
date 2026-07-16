@@ -1,0 +1,74 @@
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method,
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    credentials: 'include',
+  })
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`
+    try {
+      const data = await res.json()
+      detail = data.detail ?? detail
+    } catch {}
+    throw new Error(detail)
+  }
+  if (res.status === 204) return undefined as T
+  return res.json()
+}
+
+export const api = {
+  auth: {
+    login: (username: string, password: string) =>
+      request<{ username: string; role: string; id: string }>('POST', '/api/auth/login', { username, password }),
+    logout: () => request<void>('POST', '/api/auth/logout'),
+    me: () => request<{ id: string; username: string; role: string }>('GET', '/api/auth/me'),
+  },
+  users: {
+    list: () => request<import('./types').User[]>('GET', '/api/users/'),
+    create: (username: string, password: string, role: string) =>
+      request('POST', '/api/users/', { username, password, role }),
+    update: (id: string, data: { role?: string; password?: string; is_active?: boolean }) =>
+      request('PATCH', `/api/users/${id}`, data),
+    changePassword: (password: string) =>
+      request('POST', '/api/users/me/password', { password }),
+  },
+  clusters: {
+    list: () => request<import('./types').Cluster[]>('GET', '/api/clusters/'),
+    create: (data: {
+      display_name: string
+      host: string
+      port: number
+      token?: string
+      username?: string
+      password?: string
+      insecure: boolean
+    }) => request<import('./types').Cluster>('POST', '/api/clusters/', data),
+    update: (id: string, data: object) => request('PATCH', `/api/clusters/${id}`, data),
+    delete: (id: string) => request('DELETE', `/api/clusters/${id}`),
+  },
+  inspect: {
+    groups: (clusterId: string, olderThanDays = 90) =>
+      request<{ cluster_name: string; groups: import('./types').SnapshotGroup[] }>(
+        'GET', `/api/clusters/${clusterId}/groups?older_than_days=${olderThanDays}`
+      ),
+    curve: (clusterId: string, sourceFileId: string) =>
+      request<{ rows: import('./types').ReclaimRow[]; points: import('./types').CurvePoint[]; unmeasured_pairs: number }>(
+        'GET', `/api/clusters/${clusterId}/groups/${sourceFileId}/curve`
+      ),
+    startInspect: (clusterId: string, sourceFileId: string, path: string) =>
+      request<{ job_id: string; reused: boolean }>(
+        'POST', `/api/clusters/${clusterId}/inspect`, { source_file_id: sourceFileId, path }
+      ),
+    cancelInspect: (clusterId: string, jobId: string) =>
+      request<{ ok: boolean }>('POST', `/api/clusters/${clusterId}/jobs/${jobId}/cancel`),
+    olderThan: (clusterId: string, sourceFileId: string, before: string) =>
+      request<{ snapshot_ids: number[]; count: number }>(
+        'GET', `/api/clusters/${clusterId}/older-than?source_file_id=${sourceFileId}&before=${before}`
+      ),
+    deleteSnapshots: (clusterId: string, snapshotIds: number[]) =>
+      request<{ deleted: number[]; errors: { id: number; error: string }[] }>(
+        'POST', `/api/clusters/${clusterId}/snapshots/delete`, { snapshot_ids: snapshotIds }
+      ),
+  },
+}
