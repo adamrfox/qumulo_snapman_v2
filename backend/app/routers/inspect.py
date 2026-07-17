@@ -974,6 +974,20 @@ async def delete_snapshots(
                 deleted.append(snap_id)
             except Exception as e:
                 errors.append({"id": snap_id, "error": str(e)})
+
+        if deleted:
+            # The cached snapshot listing is now stale (up to 5 minutes, per
+            # snapshot_listing_ttl) -- we know for a fact it changed, so
+            # refresh it immediately rather than leaving ghost ids around
+            # for every subsequent Inspect/Size-snapshots/Estimate call.
+            cache = _open_cache()
+            try:
+                cluster_name = api.get_cluster_name(qclient)
+                snaps = api.list_snapshots(qclient)
+                cache.put_listing(cluster_name, [asdict(s) for s in snaps])
+            finally:
+                cache.close()
+
         return deleted, errors
 
     deleted, errors = await asyncio.get_event_loop().run_in_executor(None, _worker)
