@@ -21,12 +21,20 @@ export default function Dashboard() {
   const [clusterName, setClusterName] = useState('')
   const [loadingGroups, setLoadingGroups] = useState(false)
   const [error, setError] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
   const [showAddCluster, setShowAddCluster] = useState(false)
   const [authMode, setAuthMode] = useState<'token' | 'credentials'>('credentials')
   const [form, setForm] = useState({
     display_name: '', host: '', port: 8000, token: '', username: '', password: '', insecure: false,
   })
   const [addError, setAddError] = useState('')
+
+  const [editingCluster, setEditingCluster] = useState<Cluster | null>(null)
+  const [editAuthMode, setEditAuthMode] = useState<'token' | 'credentials'>('credentials')
+  const [editForm, setEditForm] = useState({
+    display_name: '', host: '', port: 8000, token: '', username: '', password: '', insecure: false,
+  })
+  const [editError, setEditError] = useState('')
 
   useEffect(() => {
     api.clusters.list().then(setClusters).catch(() => {})
@@ -41,6 +49,22 @@ export default function Dashboard() {
       .catch(e => setError(e.message))
       .finally(() => setLoadingGroups(false))
   }, [selectedId])
+
+  async function refreshCluster() {
+    if (!selectedId) return
+    setRefreshing(true)
+    setError('')
+    try {
+      await api.clusters.refresh(selectedId)
+      const r = await api.inspect.groups(selectedId)
+      setGroups(r.groups)
+      setClusterName(r.cluster_name)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to refresh')
+    } finally {
+      setRefreshing(false)
+    }
+  }
 
   async function addCluster(e: React.FormEvent) {
     e.preventDefault()
@@ -60,6 +84,51 @@ export default function Dashboard() {
     }
   }
 
+  function openEdit(c: Cluster) {
+    setEditingCluster(c)
+    setEditAuthMode('credentials')
+    setEditForm({
+      display_name: c.display_name, host: c.host, port: c.port,
+      token: '', username: '', password: '', insecure: c.insecure,
+    })
+    setEditError('')
+  }
+
+  async function submitEdit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!editingCluster) return
+    setEditError('')
+    try {
+      const { display_name, host, port, insecure } = editForm
+      const payload: Parameters<typeof api.clusters.update>[1] = { display_name, host, port, insecure }
+      if (editAuthMode === 'token' && editForm.token) {
+        payload.token = editForm.token
+      } else if (editAuthMode === 'credentials' && editForm.username && editForm.password) {
+        payload.username = editForm.username
+        payload.password = editForm.password
+      }
+      const updated = await api.clusters.update(editingCluster.id, payload)
+      setClusters(prev => prev.map(c => c.id === updated.id ? updated : c))
+      setEditingCluster(null)
+    } catch (err: unknown) {
+      setEditError(err instanceof Error ? err.message : 'Failed to update cluster')
+    }
+  }
+
+  async function deleteCluster(c: Cluster) {
+    if (!window.confirm(`Remove "${c.display_name}"? This only removes it from snapman — it does not affect the Qumulo cluster.`)) return
+    try {
+      await api.clusters.delete(c.id)
+      setClusters(prev => prev.filter(x => x.id !== c.id))
+      if (selectedId === c.id) {
+        setSelectedId(null)
+        setGroups([])
+      }
+    } catch (err: unknown) {
+      window.alert(err instanceof Error ? err.message : 'Failed to delete cluster')
+    }
+  }
+
   return (
     <div className="flex h-full">
       {/* Sidebar */}
@@ -74,16 +143,32 @@ export default function Dashboard() {
         </div>
         <ul>
           {clusters.map(c => (
-            <li key={c.id}>
+            <li key={c.id} className="group relative">
               <button
                 onClick={() => setSelectedId(c.id)}
-                className={`w-full px-4 py-2.5 text-left text-sm ${
+                className={`w-full px-4 py-2.5 pr-14 text-left text-sm ${
                   selectedId === c.id ? 'bg-blackberry-850 font-medium text-agave-400' : 'text-lychee-300 hover:bg-blackberry-850'
                 }`}
               >
                 <div className="truncate">{c.display_name}</div>
                 <div className="truncate text-xs text-lychee-500">{c.host}</div>
               </button>
+              <div className="absolute right-2 top-1/2 hidden -translate-y-1/2 gap-2 group-hover:flex">
+                <button
+                  onClick={() => openEdit(c)}
+                  title="Edit cluster"
+                  className="text-xs text-lychee-400 hover:text-agave-400"
+                >
+                  Edit
+                </button>
+                <button
+                  onClick={() => deleteCluster(c)}
+                  title="Delete cluster"
+                  className="text-xs text-lychee-400 hover:text-pomegranate-400"
+                >
+                  Delete
+                </button>
+              </div>
             </li>
           ))}
           {clusters.length === 0 && (
@@ -102,9 +187,19 @@ export default function Dashboard() {
 
         {selectedId && (
           <>
-            <div className="mb-4">
-              <h2 className="text-lg font-light text-lychee-100">{clusterName || '…'}</h2>
-              <p className="text-sm text-lychee-400">Snapshot groups — click a row to inspect</p>
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-light text-lychee-100">{clusterName || '…'}</h2>
+                <p className="text-sm text-lychee-400">Snapshot groups — click a row to inspect</p>
+              </div>
+              <button
+                onClick={refreshCluster}
+                disabled={refreshing}
+                title="Bypass the 5-minute cache and re-fetch the snapshot list from the cluster now"
+                className="rounded-md border border-blackberry-700 px-3 py-1.5 text-xs text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
+              >
+                {refreshing ? 'Refreshing…' : 'Refresh'}
+              </button>
             </div>
 
             {loadingGroups && <p className="text-sm text-lychee-400">Loading groups…</p>}
@@ -267,6 +362,120 @@ export default function Dashboard() {
                   className="rounded-md bg-agave-500 px-4 py-1.5 text-sm text-blackberry-950 hover:bg-agave-600"
                 >
                   Add
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit cluster modal */}
+      {editingCluster && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-lg border border-blackberry-700 bg-blackberry-900 p-6 shadow-xl">
+            <h3 className="mb-4 text-base font-semibold text-lychee-100">Edit cluster</h3>
+            <form onSubmit={submitEdit} className="space-y-3">
+              <div>
+                <label className="mb-1 block text-xs font-medium text-lychee-400">Display name</label>
+                <input
+                  value={editForm.display_name}
+                  onChange={e => setEditForm(f => ({ ...f, display_name: e.target.value }))}
+                  required
+                  className="w-full rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                />
+              </div>
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <label className="mb-1 block text-xs font-medium text-lychee-400">Host</label>
+                  <input
+                    value={editForm.host}
+                    onChange={e => setEditForm(f => ({ ...f, host: e.target.value }))}
+                    required
+                    className="w-full rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                  />
+                </div>
+                <div className="w-20">
+                  <label className="mb-1 block text-xs font-medium text-lychee-400">Port</label>
+                  <input
+                    type="number"
+                    value={editForm.port}
+                    onChange={e => setEditForm(f => ({ ...f, port: Number(e.target.value) }))}
+                    className="w-full rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                  />
+                </div>
+              </div>
+
+              <p className="text-xs text-lychee-500">Leave the fields below blank to keep the current token.</p>
+              <div className="flex gap-1 rounded-md border border-blackberry-700 bg-blackberry-800 p-1 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setEditAuthMode('credentials')}
+                  className={`flex-1 rounded px-2 py-1 ${editAuthMode === 'credentials' ? 'bg-agave-500 text-blackberry-950' : 'text-lychee-300 hover:bg-blackberry-850'}`}
+                >
+                  Username &amp; password
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditAuthMode('token')}
+                  className={`flex-1 rounded px-2 py-1 ${editAuthMode === 'token' ? 'bg-agave-500 text-blackberry-950' : 'text-lychee-300 hover:bg-blackberry-850'}`}
+                >
+                  Bearer token
+                </button>
+              </div>
+
+              {editAuthMode === 'credentials' ? (
+                <div className="flex gap-2">
+                  <div className="flex-1">
+                    <label className="mb-1 block text-xs font-medium text-lychee-400">Username</label>
+                    <input
+                      value={editForm.username}
+                      onChange={e => setEditForm(f => ({ ...f, username: e.target.value }))}
+                      className="w-full rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="mb-1 block text-xs font-medium text-lychee-400">Password</label>
+                    <input
+                      type="password"
+                      value={editForm.password}
+                      onChange={e => setEditForm(f => ({ ...f, password: e.target.value }))}
+                      className="w-full rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-lychee-400">Bearer token</label>
+                  <input
+                    type="password"
+                    value={editForm.token}
+                    onChange={e => setEditForm(f => ({ ...f, token: e.target.value }))}
+                    className="w-full rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                  />
+                </div>
+              )}
+              <label className="flex items-center gap-2 text-sm text-lychee-300">
+                <input
+                  type="checkbox"
+                  checked={editForm.insecure}
+                  onChange={e => setEditForm(f => ({ ...f, insecure: e.target.checked }))}
+                />
+                Skip TLS certificate verification
+              </label>
+              {editError && <p className="text-xs text-pomegranate-400">{editError}</p>}
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setEditingCluster(null)}
+                  className="rounded-md px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="rounded-md bg-agave-500 px-4 py-1.5 text-sm text-blackberry-950 hover:bg-agave-600"
+                >
+                  Save
                 </button>
               </div>
             </form>

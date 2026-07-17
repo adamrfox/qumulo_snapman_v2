@@ -37,7 +37,9 @@ class Cluster(Base):
     insecure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
-    jobs: Mapped[list["InspectJob"]] = relationship("InspectJob", back_populates="cluster")
+    jobs: Mapped[list["InspectJob"]] = relationship(
+        "InspectJob", back_populates="cluster", cascade="all, delete-orphan"
+    )
 
 
 class InspectJob(Base):
@@ -51,6 +53,7 @@ class InspectJob(Base):
     source_file_id: Mapped[str] = mapped_column(String(64), nullable=False)
     path: Mapped[str] = mapped_column(String(4096), nullable=False)
     started_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(32), nullable=False, default="inspect")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
     started_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow

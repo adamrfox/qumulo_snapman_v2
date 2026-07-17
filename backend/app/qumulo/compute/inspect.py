@@ -5,6 +5,8 @@ the observer protocol to SSE events via a push callback.
 """
 
 import concurrent.futures
+import sys
+import time
 
 from collections.abc import Callable
 from typing import Protocol
@@ -26,9 +28,7 @@ class InspectObserver(Protocol):
     def set_overlapped(self, overlapped: bool) -> None: ...
     def start_pair(self, index: int, total: int, older: Snapshot, newer: Snapshot) -> None: ...
     def pair_finished(self, index: int) -> None: ...
-    def candidate_found(self) -> None: ...
-    def candidate_sized(self) -> None: ...
-    def enumeration_done(self, index: int) -> None: ...
+    def progress(self, index: int, found: int, sized: int) -> None: ...
     def pair_sized(self, freed_bytes: int) -> None: ...
     def pair_result(
         self,
@@ -41,18 +41,23 @@ class InspectObserver(Protocol):
         cached: bool,
         pending: bool,
         timed_out: bool = False,
+        error: str | None = None,
+        skipped_held: bool = False,
     ) -> None: ...
     def no_curve(self) -> None: ...
     def finish(self) -> None: ...
 
 
 class WebObserver:
-    """Translates InspectObserver calls into push(type, data) SSE events."""
+    """Translates InspectObserver calls into push(type, data) SSE events.
+
+    Stateless by design: with pair_workers > 1, several pairs' _PairProgress
+    instances call in concurrently, so found/sized/index must live on the
+    per-pair caller (see _PairProgress below), never here.
+    """
 
     def __init__(self, push: PushFn) -> None:
         self._push = push
-        self._found = 0
-        self._sized = 0
 
     def set_overlapped(self, overlapped: bool) -> None:
         self._push("overlapped", {"overlapped": overlapped})
@@ -64,23 +69,19 @@ class WebObserver:
                 "index": index,
                 "total": total,
                 "older_id": older.id,
+                "older_name": older.name,
                 "older_date": older.timestamp[:10],
                 "newer_id": newer.id,
+                "newer_name": newer.name,
                 "newer_date": newer.timestamp[:10],
             },
         )
 
     def pair_finished(self, index: int) -> None:
-        pass
+        self._push("pair_finished", {"index": index})
 
-    def candidate_found(self) -> None:
-        self._found += 1
-
-    def candidate_sized(self) -> None:
-        self._sized += 1
-
-    def enumeration_done(self, index: int) -> None:
-        self._push("progress", {"index": index, "found": self._found, "sized": self._sized})
+    def progress(self, index: int, found: int, sized: int) -> None:
+        self._push("progress", {"index": index, "found": found, "sized": sized})
 
     def pair_sized(self, freed_bytes: int) -> None:
         self._push("discovered", {"freed_bytes": freed_bytes})
@@ -96,6 +97,8 @@ class WebObserver:
         cached: bool,
         pending: bool,
         timed_out: bool = False,
+        error: str | None = None,
+        skipped_held: bool = False,
     ) -> None:
         self._push(
             "pair_result",
@@ -111,6 +114,8 @@ class WebObserver:
                 "cached": cached,
                 "pending": pending,
                 "timed_out": timed_out,
+                "error": error,
+                "skipped_held": skipped_held,
             },
         )
 
@@ -121,19 +126,39 @@ class WebObserver:
         self._push("finish", {})
 
 
+_PROGRESS_PUSH_INTERVAL = 2.0  # seconds; caps how often "progress" fires during a big pair
+
+
 class _PairProgress:
-    def __init__(self, observer: InspectObserver, index: int) -> None:
+    """Per-pair progress state. A fresh instance is created for every pair, so
+    concurrent pairs (pair_workers > 1) never share found/sized/throttle
+    state -- each pushes its own index correctly regardless of what else is
+    running at the same time."""
+
+    def __init__(self, observer: InspectObserver, index: int, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._observer = observer
         self._index = index
+        self._found = 0
+        self._sized = 0
+        self._clock = clock
+        self._last_push = clock()
 
     def candidate_found(self) -> None:
-        self._observer.candidate_found()
+        self._found += 1
+        self._maybe_push()
 
     def candidate_sized(self) -> None:
-        self._observer.candidate_sized()
+        self._sized += 1
+        self._maybe_push()
+
+    def _maybe_push(self) -> None:
+        now = self._clock()
+        if now - self._last_push >= _PROGRESS_PUSH_INTERVAL:
+            self._last_push = now
+            self._observer.progress(self._index, self._found, self._sized)
 
     def enumeration_done(self) -> None:
-        self._observer.enumeration_done(self._index)
+        self._observer.progress(self._index, self._found, self._sized)
 
 
 def run_inspect(
@@ -150,6 +175,7 @@ def run_inspect(
     cached_only: bool = False,
     pair_workers: int = 1,
     compute: ComputeFn = compute_pair_contribution,
+    include_held: bool = False,
 ) -> None:
     observer.set_overlapped(overlapped)
     snaps = sorted(snapshots, key=lambda s: s.id)
@@ -164,6 +190,7 @@ def run_inspect(
 
     cached_pairs = cache.get_pairs(cluster_name, source_id)
     partials = cache.get_partials(cluster_name, source_id)
+    errors: dict[int, str] = {}
 
     outcome: list[tuple[str, int, int] | None] = [None] * total
     uncached: list[int] = []
@@ -172,6 +199,11 @@ def run_inspect(
         if cached is not None:
             outcome[i] = ("cached", cached[0], cached[1])
             observer.pair_sized(cached[0])
+        elif not include_held and older.held:
+            # older can't actually be deleted (locked, or replication-owned)
+            # so its exact reclaim size isn't an actionable number -- skip by
+            # default rather than burning time on a potentially huge diff.
+            outcome[i] = ("skipped_held", 0, 0)
         else:
             uncached.append(i)
 
@@ -186,10 +218,9 @@ def run_inspect(
         pending_queue = to_resume + fresh
 
     sizing_ex = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    abort: list[BaseException] = []
 
     def stop_all() -> bool:
-        return should_stop() or bool(abort)
+        return should_stop()
 
     def _size_one(i: int, resume: tuple[str, int, int] | None) -> PairContribution:
         older, newer = pairs[i]
@@ -244,7 +275,12 @@ def run_inspect(
         except ApiTimeout:
             outcome[i] = ("timed_out", 0, 0)
         except Exception as e:
-            abort.append(e)
+            # A single pair's failure (this cluster call failed, this
+            # snapshot expired mid-diff, etc.) is scoped to this pair -- it
+            # must not cost the other pairs their already-completed results.
+            outcome[i] = ("error", 0, 0)
+            errors[i] = str(e)
+            print(f"[snapman] pair {i + 1} failed: {e!r}", file=sys.stderr)
         finally:
             observer.pair_finished(i + 1)
 
@@ -259,14 +295,12 @@ def run_inspect(
     finally:
         producers.shutdown(wait=True, cancel_futures=True)
         sizing_ex.shutdown(wait=False, cancel_futures=True)
-    if abort:
-        raise abort[0]
 
     for i in pending_queue:
         if outcome[i] is None:
             outcome[i] = ("pending", 0, 0)
 
-    _emit_curve(observer, pairs, outcome)
+    _emit_curve(observer, pairs, outcome, errors)
     observer.finish()
 
 
@@ -274,10 +308,11 @@ def _emit_curve(
     observer: InspectObserver,
     pairs: list[tuple[Snapshot, Snapshot]],
     outcome: list[tuple[str, int, int] | None],
+    errors: dict[int, str],
 ) -> None:
     cumulative = 0
     known = True
-    for (older, newer), out in zip(pairs, outcome):
+    for i, ((older, newer), out) in enumerate(zip(pairs, outcome)):
         if out is None or out[0] == "pending":
             known = False
             observer.pair_result(older, newer, None, None, None, cached=False, pending=True)
@@ -286,6 +321,18 @@ def _emit_curve(
             known = False
             observer.pair_result(
                 older, newer, None, None, None, cached=False, pending=True, timed_out=True
+            )
+            continue
+        if out[0] == "skipped_held":
+            known = False
+            observer.pair_result(
+                older, newer, None, None, None, cached=False, pending=True, skipped_held=True
+            )
+            continue
+        if out[0] == "error":
+            known = False
+            observer.pair_result(
+                older, newer, None, None, None, cached=False, pending=False, error=errors.get(i)
             )
             continue
         status, freed, files = out

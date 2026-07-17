@@ -13,7 +13,14 @@ import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-_TABLES = ("snapshot_listing", "source_path", "pair_contribution", "pair_partial")
+_TABLES = (
+    "snapshot_listing",
+    "source_path",
+    "pair_contribution",
+    "pair_partial",
+    "triple_contribution",
+    "triple_partial",
+)
 
 
 class Cache:
@@ -75,6 +82,33 @@ class Cache:
                 partial_files  INTEGER NOT NULL,
                 updated_at     REAL NOT NULL,
                 PRIMARY KEY (cluster_name, source_file_id, older_id, newer_id)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS triple_contribution (
+                cluster_name    TEXT NOT NULL,
+                source_file_id  TEXT NOT NULL,
+                prev_id         INTEGER NOT NULL,
+                target_id       INTEGER NOT NULL,
+                next_id         INTEGER NOT NULL,
+                exclusive_bytes INTEGER NOT NULL,
+                total_files     INTEGER NOT NULL,
+                computed_at     REAL NOT NULL,
+                PRIMARY KEY (cluster_name, source_file_id, prev_id, target_id, next_id)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS triple_partial (
+                cluster_name      TEXT NOT NULL,
+                source_file_id    TEXT NOT NULL,
+                prev_id           INTEGER NOT NULL,
+                target_id         INTEGER NOT NULL,
+                next_id           INTEGER NOT NULL,
+                sized_index       INTEGER NOT NULL,
+                partial_exclusive INTEGER NOT NULL,
+                partial_files     INTEGER NOT NULL,
+                updated_at        REAL NOT NULL,
+                PRIMARY KEY (cluster_name, source_file_id, prev_id, target_id, next_id)
             )"""
         )
         self._conn.commit()
@@ -210,6 +244,82 @@ class Cache:
                 "DELETE FROM pair_partial WHERE cluster_name = ? AND source_file_id = ? "
                 "AND older_id = ? AND newer_id = ?",
                 (cluster_name, source_file_id, older_id, newer_id),
+            )
+            self._conn.commit()
+
+    # -- per-triple (middle-snapshot exclusive) contribution ----------------
+
+    def get_triples(
+        self, cluster_name: str, source_file_id: str
+    ) -> dict[tuple[int, int, int], tuple[int, int]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT prev_id, target_id, next_id, exclusive_bytes, total_files "
+                "FROM triple_contribution WHERE cluster_name = ? AND source_file_id = ?",
+                (cluster_name, source_file_id),
+            ).fetchall()
+        return {(r[0], r[1], r[2]): (r[3], r[4]) for r in rows}
+
+    def put_triple(
+        self,
+        cluster_name: str,
+        source_file_id: str,
+        prev_id: int,
+        target_id: int,
+        next_id: int,
+        exclusive_bytes: int,
+        total_files: int,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO triple_contribution (cluster_name, source_file_id, "
+                "prev_id, target_id, next_id, exclusive_bytes, total_files, computed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (cluster_name, source_file_id, prev_id, target_id, next_id,
+                 exclusive_bytes, total_files, self._now()),
+            )
+            self._conn.commit()
+
+    def get_triple_partials(
+        self, cluster_name: str, source_file_id: str
+    ) -> dict[tuple[int, int, int], tuple[int, int, int]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT prev_id, target_id, next_id, sized_index, partial_exclusive, partial_files "
+                "FROM triple_partial WHERE cluster_name = ? AND source_file_id = ?",
+                (cluster_name, source_file_id),
+            ).fetchall()
+        return {(r[0], r[1], r[2]): (r[3], r[4], r[5]) for r in rows}
+
+    def put_triple_partial(
+        self,
+        cluster_name: str,
+        source_file_id: str,
+        prev_id: int,
+        target_id: int,
+        next_id: int,
+        sized_index: int,
+        partial_exclusive: int,
+        partial_files: int,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO triple_partial (cluster_name, source_file_id, "
+                "prev_id, target_id, next_id, sized_index, partial_exclusive, partial_files, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (cluster_name, source_file_id, prev_id, target_id, next_id,
+                 sized_index, partial_exclusive, partial_files, self._now()),
+            )
+            self._conn.commit()
+
+    def delete_triple_partial(
+        self, cluster_name: str, source_file_id: str, prev_id: int, target_id: int, next_id: int
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM triple_partial WHERE cluster_name = ? AND source_file_id = ? "
+                "AND prev_id = ? AND target_id = ? AND next_id = ?",
+                (cluster_name, source_file_id, prev_id, target_id, next_id),
             )
             self._conn.commit()
 

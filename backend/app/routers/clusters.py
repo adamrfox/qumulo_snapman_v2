@@ -64,6 +64,8 @@ class ClusterCreate(BaseModel):
 class ClusterUpdate(BaseModel):
     display_name: str | None = None
     token: str | None = None
+    username: str | None = None
+    password: str | None = None
     insecure: bool | None = None
     host: str | None = None
     port: int | None = None
@@ -138,10 +140,28 @@ async def update_cluster(
         cluster.host = req.host
     if req.port is not None:
         cluster.port = req.port
-    if req.token is not None:
-        cluster.token_encrypted = settings.fernet.encrypt(req.token.encode()).decode()
     if req.insecure is not None:
         cluster.insecure = req.insecure
+
+    if req.token is not None:
+        cluster.token_encrypted = settings.fernet.encrypt(req.token.encode()).decode()
+    elif req.username and req.password:
+        try:
+            token = await asyncio.get_event_loop().run_in_executor(
+                None,
+                qumulo_login,
+                cluster.host,
+                cluster.port,
+                req.username,
+                req.password,
+                cluster.insecure,
+            )
+        except ApiError as e:
+            raise HTTPException(400, f"Qumulo login failed: {e}")
+        except Exception as e:
+            raise HTTPException(400, f"Could not reach cluster: {e}")
+        cluster.token_encrypted = settings.fernet.encrypt(token.encode()).decode()
+
     await db.commit()
     return _serialize(cluster)
 

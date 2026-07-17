@@ -27,6 +27,12 @@ export default function App() {
       .finally(() => setLoading(false))
   }, [])
 
+  useEffect(() => {
+    const onUnauthorized = () => setUser(null)
+    window.addEventListener('snapman:unauthorized', onUnauthorized)
+    return () => window.removeEventListener('snapman:unauthorized', onUnauthorized)
+  }, [])
+
   if (loading) {
     return <div className="flex h-screen items-center justify-center bg-blackberry-950 text-lychee-400">Loading…</div>
   }

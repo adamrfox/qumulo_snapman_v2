@@ -6,6 +6,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     credentials: 'include',
   })
   if (!res.ok) {
+    if (res.status === 401 && path !== '/api/auth/login' && path !== '/api/auth/me') {
+      window.dispatchEvent(new CustomEvent('snapman:unauthorized'))
+      throw new Error('Your snapman session has expired. Please sign in again.')
+    }
     let detail = `HTTP ${res.status}`
     try {
       const data = await res.json()
@@ -30,8 +34,8 @@ export const api = {
       request('POST', '/api/users/', { username, password, role }),
     update: (id: string, data: { role?: string; password?: string; is_active?: boolean }) =>
       request('PATCH', `/api/users/${id}`, data),
-    changePassword: (password: string) =>
-      request('POST', '/api/users/me/password', { password }),
+    changePassword: (currentPassword: string, newPassword: string) =>
+      request('POST', '/api/users/me/password', { current_password: currentPassword, new_password: newPassword }),
   },
   clusters: {
     list: () => request<import('./types').Cluster[]>('GET', '/api/clusters/'),
@@ -44,8 +48,18 @@ export const api = {
       password?: string
       insecure: boolean
     }) => request<import('./types').Cluster>('POST', '/api/clusters/', data),
-    update: (id: string, data: object) => request('PATCH', `/api/clusters/${id}`, data),
+    update: (id: string, data: {
+      display_name?: string
+      host?: string
+      port?: number
+      token?: string
+      username?: string
+      password?: string
+      insecure?: boolean
+    }) => request<import('./types').Cluster>('PATCH', `/api/clusters/${id}`, data),
     delete: (id: string) => request('DELETE', `/api/clusters/${id}`),
+    refresh: (id: string) =>
+      request<{ cluster_name: string; snapshot_count: number }>('POST', `/api/clusters/${id}/refresh`),
   },
   inspect: {
     groups: (clusterId: string, olderThanDays = 90) =>
@@ -56,9 +70,21 @@ export const api = {
       request<{ rows: import('./types').ReclaimRow[]; points: import('./types').CurvePoint[]; unmeasured_pairs: number }>(
         'GET', `/api/clusters/${clusterId}/groups/${sourceFileId}/curve`
       ),
-    startInspect: (clusterId: string, sourceFileId: string, path: string) =>
+    snapshotSizes: (clusterId: string, sourceFileId: string) =>
+      request<{ cluster_name: string; source_file_id: string; snapshots: import('./types').SnapshotSizeRow[]; last_run: import('./types').LastRun | null }>(
+        'GET', `/api/clusters/${clusterId}/groups/${sourceFileId}/snapshots`
+      ),
+    startInspect: (clusterId: string, sourceFileId: string, path: string, includeHeld = false) =>
       request<{ job_id: string; reused: boolean }>(
-        'POST', `/api/clusters/${clusterId}/inspect`, { source_file_id: sourceFileId, path }
+        'POST', `/api/clusters/${clusterId}/inspect`, { source_file_id: sourceFileId, path, include_held: includeHeld }
+      ),
+    startSizeSnapshots: (clusterId: string, sourceFileId: string, path: string, includeHeld = false) =>
+      request<{ job_id: string; reused: boolean }>(
+        'POST', `/api/clusters/${clusterId}/groups/${sourceFileId}/size-snapshots`, { path, include_held: includeHeld }
+      ),
+    estimateDeletion: (clusterId: string, sourceFileId: string, snapshotIds: number[]) =>
+      request<{ job_id: string; reused: boolean }>(
+        'POST', `/api/clusters/${clusterId}/groups/${sourceFileId}/estimate-deletion`, { snapshot_ids: snapshotIds }
       ),
     cancelInspect: (clusterId: string, jobId: string) =>
       request<{ ok: boolean }>('POST', `/api/clusters/${clusterId}/jobs/${jobId}/cancel`),

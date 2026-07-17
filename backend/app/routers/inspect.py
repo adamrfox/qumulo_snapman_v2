@@ -41,6 +41,36 @@ def _open_cache():
 
 
 # ---------------------------------------------------------------------------
+# POST /{cluster_id}/refresh — bypass the snapshot-listing TTL and re-fetch now
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{cluster_id}/refresh")
+async def refresh_snapshots(
+    cluster_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    cluster = await get_authorized_cluster(cluster_id, user, db)
+
+    def _worker():
+        from app.qumulo import api
+
+        qclient = _make_qclient(cluster)
+        cache = _open_cache()
+        try:
+            cluster_name = api.get_cluster_name(qclient)
+            snaps = api.list_snapshots(qclient)
+            cache.put_listing(cluster_name, [asdict(s) for s in snaps])
+            return cluster_name, len(snaps)
+        finally:
+            cache.close()
+
+    cluster_name, count = await asyncio.get_event_loop().run_in_executor(None, _worker)
+    return {"cluster_name": cluster_name, "snapshot_count": count}
+
+
+# ---------------------------------------------------------------------------
 # GET /{cluster_id}/groups
 # ---------------------------------------------------------------------------
 
@@ -200,6 +230,122 @@ async def get_curve(
 
 
 # ---------------------------------------------------------------------------
+# GET /{cluster_id}/groups/{source_file_id}/snapshots  (cached, no new work)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{cluster_id}/groups/{source_file_id}/snapshots")
+async def get_snapshot_sizes(
+    cluster_id: str,
+    source_file_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    cluster = await get_authorized_cluster(cluster_id, user, db)
+
+    def _worker():
+        from app.qumulo import api
+        from app.qumulo.compute.groups import age_days, group_snapshots
+
+        qclient = _make_qclient(cluster)
+        cache = _open_cache()
+        try:
+            cluster_name = api.get_cluster_name(qclient)
+            cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
+            if cached is None:
+                snaps = api.list_snapshots(qclient)
+                cache.put_listing(cluster_name, [asdict(s) for s in snaps])
+            else:
+                snaps = [api.Snapshot.from_json(d) for d in cached]
+
+            now = datetime.now(timezone.utc)
+            groups = group_snapshots(snaps, now)
+            group = next((g for g in groups if g.source_file_id == source_file_id), None)
+            if group is None:
+                return None
+
+            snaps_sorted = sorted(group.snapshots, key=lambda s: s.id)
+            n = len(snaps_sorted)
+            pairs = cache.get_pairs(cluster_name, source_file_id)
+            triples = cache.get_triples(cluster_name, source_file_id)
+            pair_partials = cache.get_partials(cluster_name, source_file_id)
+            triple_partials = cache.get_triple_partials(cluster_name, source_file_id)
+
+            rows = []
+            for i, snap in enumerate(snaps_sorted):
+                exclusive_bytes = total_files = None
+                if n == 1 or i == n - 1:
+                    status = "not_sizable"
+                elif i == 0:
+                    key = (snaps_sorted[0].id, snaps_sorted[1].id)
+                    pair = pairs.get(key)
+                    if pair:
+                        status = "computed"
+                        exclusive_bytes, total_files = pair
+                    elif key in pair_partials:
+                        status = "partial"
+                    elif snap.held:
+                        status = "skipped_held"
+                    else:
+                        status = "unmeasured"
+                else:
+                    key3 = (snaps_sorted[i - 1].id, snap.id, snaps_sorted[i + 1].id)
+                    triple = triples.get(key3)
+                    if triple:
+                        status = "computed"
+                        exclusive_bytes, total_files = triple
+                    elif key3 in triple_partials:
+                        status = "partial"
+                    elif snap.held:
+                        status = "skipped_held"
+                    else:
+                        status = "unmeasured"
+                rows.append(
+                    {
+                        "id": snap.id,
+                        "name": snap.name,
+                        "date": snap.timestamp[:10],
+                        "age_days": age_days(snap.timestamp, now),
+                        "exclusive_bytes": exclusive_bytes,
+                        "total_files": total_files,
+                        "status": status,
+                        "held": snap.held,
+                        "held_reason": snap.held_reason if snap.held else None,
+                    }
+                )
+            return {"cluster_name": cluster_name, "source_file_id": source_file_id, "snapshots": rows}
+        finally:
+            cache.close()
+
+    last_job_result = await db.execute(
+        select(InspectJob)
+        .where(
+            InspectJob.cluster_id == cluster_id,
+            InspectJob.source_file_id == source_file_id,
+            InspectJob.job_type == "snapshot_exclusive",
+        )
+        .order_by(InspectJob.started_at.desc())
+        .limit(1)
+    )
+    last_job = last_job_result.scalar_one_or_none()
+    last_run = (
+        {
+            "status": last_job.status,
+            "error_message": last_job.error_message,
+            "finished_at": last_job.finished_at.isoformat() if last_job.finished_at else None,
+        }
+        if last_job is not None
+        else None
+    )
+
+    result = await asyncio.get_event_loop().run_in_executor(None, _worker)
+    if result is None:
+        raise HTTPException(404, "Source not found in snapshot listing")
+    result["last_run"] = last_run
+    return result
+
+
+# ---------------------------------------------------------------------------
 # GET /{cluster_id}/older-than
 # ---------------------------------------------------------------------------
 
@@ -255,6 +401,7 @@ async def older_than(
 class InspectRequest(BaseModel):
     source_file_id: str
     path: str
+    include_held: bool = False
 
 
 @router.post("/{cluster_id}/inspect", status_code=202)
@@ -306,7 +453,7 @@ async def start_inspect(
         "insecure": cluster.insecure,
     }
     task = asyncio.create_task(
-        _run_inspect_task(job, cluster_snapshot, req.source_file_id, req.path)
+        _run_inspect_task(job, cluster_snapshot, req.source_file_id, req.path, req.include_held)
     )
     job.task = task
 
@@ -318,6 +465,7 @@ async def _run_inspect_task(
     cluster_snapshot: dict,
     source_file_id: str,
     path: str,
+    include_held: bool = False,
 ) -> None:
     loop = asyncio.get_event_loop()
     error_message: str | None = None
@@ -367,6 +515,322 @@ async def _run_inspect_task(
                 observer=observer,
                 should_stop=lambda: job.done,
                 pair_workers=settings.pair_workers,
+                include_held=include_held,
+            )
+        except Exception as e:
+            error_message = str(e)
+            push("error", {"message": error_message})
+        finally:
+            cache.close()
+
+    try:
+        await loop.run_in_executor(None, _worker)
+    finally:
+        cancelled = job.cancel_requested
+        job.done = True
+        async with SessionLocal() as db:
+            result = await db.execute(
+                select(InspectJob).where(InspectJob.id == job.id)
+            )
+            db_job = result.scalar_one_or_none()
+            if db_job is not None:
+                if cancelled:
+                    db_job.status = "cancelled"
+                elif error_message is not None:
+                    db_job.status = "error"
+                    db_job.error_message = error_message
+                else:
+                    db_job.status = "completed"
+                db_job.finished_at = datetime.utcnow()
+                await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# POST /{cluster_id}/groups/{source_file_id}/size-snapshots — start a
+# per-snapshot exclusive-size job
+# ---------------------------------------------------------------------------
+
+
+class SizeSnapshotsRequest(BaseModel):
+    path: str
+    include_held: bool = False
+
+
+@router.post("/{cluster_id}/groups/{source_file_id}/size-snapshots", status_code=202)
+async def start_size_snapshots(
+    cluster_id: str,
+    source_file_id: str,
+    req: SizeSnapshotsRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    cluster = await get_authorized_cluster(cluster_id, user, db)
+
+    existing = job_registry.find_running(cluster_id, source_file_id, job_type="snapshot_exclusive")
+    if existing is not None:
+        return {"job_id": existing.id, "reused": True}
+
+    def _get_cluster_name():
+        from app.qumulo import api
+
+        qclient = _make_qclient(cluster)
+        return api.get_cluster_name(qclient)
+
+    cluster_name = await asyncio.get_event_loop().run_in_executor(None, _get_cluster_name)
+
+    db_job = InspectJob(
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        source_file_id=source_file_id,
+        path=req.path,
+        started_by=user.id,
+        job_type="snapshot_exclusive",
+        status="running",
+    )
+    db.add(db_job)
+    await db.commit()
+    await db.refresh(db_job)
+
+    job = job_registry.create(
+        job_id=db_job.id,
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        source_file_id=source_file_id,
+        path=req.path,
+        started_by=user.id,
+        job_type="snapshot_exclusive",
+    )
+
+    cluster_snapshot = {
+        "host": cluster.host,
+        "port": cluster.port,
+        "token_encrypted": cluster.token_encrypted,
+        "insecure": cluster.insecure,
+    }
+    task = asyncio.create_task(
+        _run_size_snapshots_task(job, cluster_snapshot, source_file_id, req.include_held)
+    )
+    job.task = task
+
+    return {"job_id": job.id, "reused": False}
+
+
+async def _run_size_snapshots_task(
+    job: job_registry.InspectJob,
+    cluster_snapshot: dict,
+    source_file_id: str,
+    include_held: bool = False,
+) -> None:
+    loop = asyncio.get_event_loop()
+    error_message: str | None = None
+
+    def push(event_type: str, data: dict) -> None:
+        loop.call_soon_threadsafe(job.event_queue.put_nowait, {"type": event_type, **data})
+
+    def _worker():
+        nonlocal error_message
+        from app.qumulo import api
+        from app.qumulo.client import QumuloClient
+        from app.qumulo.compute.groups import group_snapshots
+        from app.qumulo.compute.snapshot_exclusive_job import WebTripleObserver, run_snapshot_exclusive
+
+        token = decrypt_token(cluster_snapshot["token_encrypted"])
+        qclient = QumuloClient(
+            cluster_snapshot["host"],
+            cluster_snapshot["port"],
+            token,
+            insecure=cluster_snapshot["insecure"],
+        )
+        cache = _open_cache()
+        try:
+            cluster_name = api.get_cluster_name(qclient)
+            cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
+            if cached is None:
+                snaps = api.list_snapshots(qclient)
+                cache.put_listing(cluster_name, [asdict(s) for s in snaps])
+            else:
+                snaps = [api.Snapshot.from_json(d) for d in cached]
+
+            groups = group_snapshots(snaps, datetime.now(timezone.utc))
+            group = next((g for g in groups if g.source_file_id == source_file_id), None)
+            if group is None:
+                error_message = f"Source {source_file_id} not found"
+                push("error", {"message": error_message})
+                return
+
+            observer = WebTripleObserver(push)
+            run_snapshot_exclusive(
+                qclient,
+                cache,
+                cluster_name,
+                group.snapshots,
+                limit=settings.pair_batch_size,
+                max_workers=settings.file_workers,
+                observer=observer,
+                should_stop=lambda: job.done,
+                triple_workers=settings.pair_workers,
+                include_held=include_held,
+            )
+        except Exception as e:
+            error_message = str(e)
+            push("error", {"message": error_message})
+        finally:
+            cache.close()
+
+    try:
+        await loop.run_in_executor(None, _worker)
+    finally:
+        cancelled = job.cancel_requested
+        job.done = True
+        async with SessionLocal() as db:
+            result = await db.execute(
+                select(InspectJob).where(InspectJob.id == job.id)
+            )
+            db_job = result.scalar_one_or_none()
+            if db_job is not None:
+                if cancelled:
+                    db_job.status = "cancelled"
+                elif error_message is not None:
+                    db_job.status = "error"
+                    db_job.error_message = error_message
+                else:
+                    db_job.status = "completed"
+                db_job.finished_at = datetime.utcnow()
+                await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# POST /{cluster_id}/groups/{source_file_id}/estimate-deletion — combined
+# space-freed estimate for an arbitrary selected set of snapshots
+# ---------------------------------------------------------------------------
+
+
+class EstimateDeletionRequest(BaseModel):
+    snapshot_ids: list[int]
+
+
+@router.post("/{cluster_id}/groups/{source_file_id}/estimate-deletion", status_code=202)
+async def start_estimate_deletion(
+    cluster_id: str,
+    source_file_id: str,
+    req: EstimateDeletionRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    cluster = await get_authorized_cluster(cluster_id, user, db)
+
+    def _prepare():
+        from app.qumulo import api
+        from app.qumulo.compute.deletion_estimate import (
+            SelectionError,
+            partition_into_runs,
+            validate_selection,
+        )
+        from app.qumulo.compute.groups import group_snapshots
+
+        qclient = _make_qclient(cluster)
+        cache = _open_cache()
+        try:
+            cluster_name = api.get_cluster_name(qclient)
+            cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
+            if cached is None:
+                snaps = api.list_snapshots(qclient)
+                cache.put_listing(cluster_name, [asdict(s) for s in snaps])
+            else:
+                snaps = [api.Snapshot.from_json(d) for d in cached]
+
+            groups = group_snapshots(snaps, datetime.now(timezone.utc))
+            group = next((g for g in groups if g.source_file_id == source_file_id), None)
+            if group is None:
+                return None, None, f"Source {source_file_id} not found"
+
+            snaps_sorted = sorted(group.snapshots, key=lambda s: s.id)
+            selected = set(req.snapshot_ids)
+            try:
+                validate_selection(snaps_sorted, selected)
+                runs = partition_into_runs(snaps_sorted, selected)
+            except SelectionError as e:
+                return None, None, str(e)
+            return cluster_name, runs, None
+        finally:
+            cache.close()
+
+    cluster_name, runs, error = await asyncio.get_event_loop().run_in_executor(None, _prepare)
+    if error is not None:
+        raise HTTPException(400, error)
+
+    db_job = InspectJob(
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        source_file_id=source_file_id,
+        path=f"{len(req.snapshot_ids)} selected snapshots",
+        started_by=user.id,
+        job_type="deletion_estimate",
+        status="running",
+    )
+    db.add(db_job)
+    await db.commit()
+    await db.refresh(db_job)
+
+    job = job_registry.create(
+        job_id=db_job.id,
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        source_file_id=source_file_id,
+        path=db_job.path,
+        started_by=user.id,
+        job_type="deletion_estimate",
+    )
+
+    cluster_snapshot = {
+        "host": cluster.host,
+        "port": cluster.port,
+        "token_encrypted": cluster.token_encrypted,
+        "insecure": cluster.insecure,
+    }
+    task = asyncio.create_task(_run_estimate_deletion_task(job, cluster_snapshot, cluster_name, source_file_id, runs))
+    job.task = task
+
+    return {"job_id": job.id, "reused": False}
+
+
+async def _run_estimate_deletion_task(
+    job: job_registry.InspectJob,
+    cluster_snapshot: dict,
+    cluster_name: str,
+    source_file_id: str,
+    runs: list,
+) -> None:
+    loop = asyncio.get_event_loop()
+    error_message: str | None = None
+
+    def push(event_type: str, data: dict) -> None:
+        loop.call_soon_threadsafe(job.event_queue.put_nowait, {"type": event_type, **data})
+
+    def _worker():
+        nonlocal error_message
+        from app.qumulo.client import QumuloClient
+        from app.qumulo.compute.deletion_estimate import WebDeletionEstimateObserver, run_deletion_estimate
+
+        token = decrypt_token(cluster_snapshot["token_encrypted"])
+        qclient = QumuloClient(
+            cluster_snapshot["host"],
+            cluster_snapshot["port"],
+            token,
+            insecure=cluster_snapshot["insecure"],
+        )
+        cache = _open_cache()
+        try:
+            observer = WebDeletionEstimateObserver(push)
+            run_deletion_estimate(
+                qclient,
+                cache,
+                cluster_name,
+                source_file_id,
+                runs,
+                max_workers=settings.file_workers,
+                observer=observer,
+                should_stop=lambda: job.done,
             )
         except Exception as e:
             error_message = str(e)

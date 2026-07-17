@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import CurrentUser, RequireAdmin, hash_password
+from app.auth import CurrentUser, RequireAdmin, hash_password, verify_password
 from app.database import get_db
 from app.models import User
 
@@ -32,6 +32,11 @@ class UpdateUserRequest(BaseModel):
     role: str | None = None
     password: str | None = None
     is_active: bool | None = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 @router.get("/")
@@ -106,12 +111,12 @@ async def deactivate_user(
 
 @router.post("/me/password")
 async def change_own_password(
-    req: UpdateUserRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    req: ChangePasswordRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ):
-    if req.password is None:
-        raise HTTPException(400, "password is required")
     result = await db.execute(select(User).where(User.id == user.id))
     db_user = result.scalar_one()
-    db_user.password_hash = hash_password(req.password)
+    if not verify_password(req.current_password, db_user.password_hash):
+        raise HTTPException(400, "Current password is incorrect")
+    db_user.password_hash = hash_password(req.new_password)
     await db.commit()
     return {"ok": True}

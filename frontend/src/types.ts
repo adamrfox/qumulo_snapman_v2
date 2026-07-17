@@ -50,6 +50,24 @@ export interface CurvePoint {
   status: 'computed' | 'cached' | 'pending' | 'timed_out'
 }
 
+export interface SnapshotSizeRow {
+  id: number
+  name: string
+  date: string
+  age_days: number
+  exclusive_bytes: number | null
+  total_files: number | null
+  status: 'not_sizable' | 'computed' | 'unmeasured' | 'partial' | 'pending' | 'timed_out' | 'skipped_held'
+  held: boolean
+  held_reason: string | null
+}
+
+export interface LastRun {
+  status: string
+  error_message: string | null
+  finished_at: string | null
+}
+
 export interface User {
   id: string
   username: string

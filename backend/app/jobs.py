@@ -17,6 +17,7 @@ class InspectJob:
     source_file_id: str
     path: str
     started_by: str
+    job_type: str = "inspect"
     event_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
     done: bool = False
@@ -33,6 +34,7 @@ def create(
     source_file_id: str,
     path: str,
     started_by: str,
+    job_type: str = "inspect",
 ) -> InspectJob:
     job = InspectJob(
         id=job_id,
@@ -41,6 +43,7 @@ def create(
         source_file_id=source_file_id,
         path=path,
         started_by=started_by,
+        job_type=job_type,
     )
     _registry[job.id] = job
     return job
@@ -50,9 +53,14 @@ def get(job_id: str) -> InspectJob | None:
     return _registry.get(job_id)
 
 
-def find_running(cluster_id: str, source_file_id: str) -> InspectJob | None:
+def find_running(cluster_id: str, source_file_id: str, job_type: str = "inspect") -> InspectJob | None:
     for job in _registry.values():
-        if job.cluster_id == cluster_id and job.source_file_id == source_file_id and not job.done:
+        if (
+            job.cluster_id == cluster_id
+            and job.source_file_id == source_file_id
+            and job.job_type == job_type
+            and not job.done
+        ):
             return job
     return None
 

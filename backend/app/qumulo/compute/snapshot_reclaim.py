@@ -4,6 +4,7 @@ Only import path changes — the algorithm is identical.
 """
 
 import concurrent.futures
+import sys
 import time
 
 from collections.abc import Callable, Iterator
@@ -161,12 +162,33 @@ def compute_pair_contribution(
     return PairContribution(older, newer, freed_running, files_running)
 
 
+def _is_unresolvable(e: ApiError) -> bool:
+    """A 404 that isn't 'the snapshot itself is gone' (that's a systemic
+    failure worth aborting for) -- e.g. fs_no_such_file_version_error, where a
+    file's identity no longer resolves in a particular snapshot for reasons
+    unrelated to the diff we're trying to compute. Once every known fallback
+    (path lookup, file_id lookup, the other snapshot) has already failed, this
+    is the last-resort classification: treat the file as unmeasurable rather
+    than aborting the whole run over one uncooperative path."""
+    return e.status_code == 404 and not e.is_snapshot_not_found()
+
+
 def _size_candidate(client: Client, c: _Candidate) -> int:
     if c.kind is _CandidateKind.KNOWN_SIZE:
         return c.size
-    if c.kind is _CandidateKind.DELETED_FILE:
-        return _deleted_freed(client, c)
-    return _modified_freed(client, c)
+    try:
+        if c.kind is _CandidateKind.DELETED_FILE:
+            return _deleted_freed(client, c)
+        return _modified_freed(client, c)
+    except ApiError as e:
+        if _is_unresolvable(e):
+            print(
+                f"[snapman] {c.path!r} unresolvable in snapshots {c.older_id}/{c.newer_id} "
+                f"({e}) -- excluded from this pair's total",
+                file=sys.stderr,
+            )
+            return 0
+        raise
 
 
 def _resolves_in(client: Client, snapshot_id: int, file_id: str) -> bool:
@@ -252,8 +274,22 @@ def _candidates_in_page(
 
 
 def _dir_moved(client: Client, older_id: int, newer_id: int, path: str) -> bool:
-    dir_id = snapshot_file_attrs(client, older_id, path=normalize_path(path)).file_id
-    return _resolves_in(client, newer_id, dir_id)
+    try:
+        dir_id = snapshot_file_attrs(client, older_id, path=normalize_path(path)).file_id
+        return _resolves_in(client, newer_id, dir_id)
+    except ApiError as e:
+        if _is_unresolvable(e):
+            # Can't tell whether this directory was truly deleted or just
+            # moved -- treat it as moved (i.e. don't recurse into it as a
+            # deletion candidate) so an unresolvable path never inflates the
+            # reclaim total, only ever potentially undercounts it.
+            print(
+                f"[snapman] {path!r} unresolvable in snapshots {older_id}/{newer_id} "
+                f"({e}) -- not counted as deleted",
+                file=sys.stderr,
+            )
+            return True
+        raise
 
 
 def _entry_path(f: FileAttrs, snapshot_id: int) -> str:
