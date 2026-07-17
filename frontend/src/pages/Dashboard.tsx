@@ -22,6 +22,8 @@ export default function Dashboard() {
   const [loadingGroups, setLoadingGroups] = useState(false)
   const [error, setError] = useState('')
   const [refreshing, setRefreshing] = useState(false)
+  const [olderThanDays, setOlderThanDays] = useState(90)
+  const [olderThanInput, setOlderThanInput] = useState('90')
   const [showAddCluster, setShowAddCluster] = useState(false)
   const [authMode, setAuthMode] = useState<'token' | 'credentials'>('credentials')
   const [form, setForm] = useState({
@@ -44,11 +46,20 @@ export default function Dashboard() {
     if (!selectedId) return
     setLoadingGroups(true)
     setError('')
-    api.inspect.groups(selectedId)
+    api.inspect.groups(selectedId, olderThanDays)
       .then(r => { setGroups(r.groups); setClusterName(r.cluster_name) })
       .catch(e => setError(e.message))
       .finally(() => setLoadingGroups(false))
-  }, [selectedId])
+  }, [selectedId, olderThanDays])
+
+  function commitOlderThan() {
+    const n = Number(olderThanInput)
+    if (Number.isFinite(n) && n >= 0) {
+      setOlderThanDays(n)
+    } else {
+      setOlderThanInput(String(olderThanDays))
+    }
+  }
 
   async function refreshCluster() {
     if (!selectedId) return
@@ -56,7 +67,7 @@ export default function Dashboard() {
     setError('')
     try {
       await api.clusters.refresh(selectedId)
-      const r = await api.inspect.groups(selectedId)
+      const r = await api.inspect.groups(selectedId, olderThanDays)
       setGroups(r.groups)
       setClusterName(r.cluster_name)
     } catch (err: unknown) {
@@ -192,14 +203,29 @@ export default function Dashboard() {
                 <h2 className="text-lg font-light text-lychee-100">{clusterName || '…'}</h2>
                 <p className="text-sm text-lychee-400">Snapshot groups — click a row to inspect</p>
               </div>
-              <button
-                onClick={refreshCluster}
-                disabled={refreshing}
-                title="Bypass the 5-minute cache and re-fetch the snapshot list from the cluster now"
-                className="rounded-md border border-blackberry-700 px-3 py-1.5 text-xs text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
-              >
-                {refreshing ? 'Refreshing…' : 'Refresh'}
-              </button>
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-1.5 text-xs text-lychee-400" title="Prunable, Measured, and Reclaim~ below all use this cutoff — snapshots older than this many days, walked from the oldest until a locked one or one inside the window is hit">
+                  Older than
+                  <input
+                    type="number"
+                    min={0}
+                    value={olderThanInput}
+                    onChange={e => setOlderThanInput(e.target.value)}
+                    onBlur={commitOlderThan}
+                    onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                    className="w-16 rounded-md border border-blackberry-700 bg-blackberry-800 px-2 py-1 text-xs text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                  />
+                  days
+                </label>
+                <button
+                  onClick={refreshCluster}
+                  disabled={refreshing}
+                  title="Bypass the 5-minute cache and re-fetch the snapshot list from the cluster now"
+                  className="rounded-md border border-blackberry-700 px-3 py-1.5 text-xs text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
+                >
+                  {refreshing ? 'Refreshing…' : 'Refresh'}
+                </button>
+              </div>
             </div>
 
             {loadingGroups && <p className="text-sm text-lychee-400">Loading groups…</p>}
