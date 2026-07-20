@@ -91,6 +91,9 @@ export default function InspectDetail() {
   const [deleteTarget, setDeleteTarget] = useState<ReclaimRow | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState('')
   const [deleteResult, setDeleteResult] = useState<{ deleted: number[]; errors: { id: number; error: string }[] } | null>(null)
+  const [deleteTargetIds, setDeleteTargetIds] = useState<number[] | null>(null)
+  const [showDeleteTargetList, setShowDeleteTargetList] = useState(false)
+  const [loadingDeleteTargetList, setLoadingDeleteTargetList] = useState(false)
   const esRef = useRef<EventSource | null>(null)
   const jobIdRef = useRef<string | null>(null)
   const cancelRequestedRef = useRef(false)
@@ -120,6 +123,7 @@ export default function InspectDetail() {
   }>>({})
   const estimateEsRef = useRef<EventSource | null>(null)
   const [showDeleteSelectedModal, setShowDeleteSelectedModal] = useState(false)
+  const [showSelectedList, setShowSelectedList] = useState(false)
   const [deleteSelectedConfirm, setDeleteSelectedConfirm] = useState('')
   const [deleteSelectedResult, setDeleteSelectedResult] = useState<{ deleted: number[]; errors: { id: number; error: string }[] } | null>(null)
   const [clusterAuthExpired, setClusterAuthExpired] = useState(false)
@@ -257,12 +261,34 @@ export default function InspectDetail() {
       })
   }
 
+  async function toggleDeleteTargetList() {
+    if (showDeleteTargetList) {
+      setShowDeleteTargetList(false)
+      return
+    }
+    if (deleteTargetIds === null && clusterId && sourceFileId && deleteTarget) {
+      setLoadingDeleteTargetList(true)
+      try {
+        const { snapshot_ids } = await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before)
+        setDeleteTargetIds(snapshot_ids)
+      } finally {
+        setLoadingDeleteTargetList(false)
+      }
+    }
+    setShowDeleteTargetList(true)
+  }
+
   async function doDelete() {
     if (!clusterId || !deleteTarget || !sourceFileId) return
-    const { snapshot_ids } = await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before)
-    const result = await api.inspect.deleteSnapshots(clusterId, snapshot_ids)
+    // Reuse the ids already fetched for the optional list, if the user looked at
+    // it, so what gets deleted is exactly what they saw rather than a second,
+    // possibly-slightly-different snapshot of "older than" at delete time.
+    const ids = deleteTargetIds ?? (await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before)).snapshot_ids
+    const result = await api.inspect.deleteSnapshots(clusterId, ids)
     setDeleteResult(result)
     setDeleteTarget(null)
+    setDeleteTargetIds(null)
+    setShowDeleteTargetList(false)
   }
 
   async function startSizeSnapshots() {
@@ -714,7 +740,7 @@ export default function InspectDetail() {
                   {canDelete && (
                     <td className="px-4 py-3 text-right">
                       <button
-                        onClick={() => { setDeleteTarget(row); setDeleteConfirm('') }}
+                        onClick={() => { setDeleteTarget(row); setDeleteConfirm(''); setDeleteTargetIds(null); setShowDeleteTargetList(false) }}
                         className="rounded-md bg-pomegranate-600 px-3 py-1 text-xs text-lychee-50 hover:bg-pomegranate-700"
                       >
                         Delete
@@ -842,7 +868,7 @@ export default function InspectDetail() {
                     {estimateRunning ? 'Estimating…' : 'Estimate combined savings'}
                   </button>
                   <button
-                    onClick={() => { setShowDeleteSelectedModal(true); setDeleteSelectedConfirm('') }}
+                    onClick={() => { setShowDeleteSelectedModal(true); setDeleteSelectedConfirm(''); setShowSelectedList(false) }}
                     className="rounded-md bg-pomegranate-600 px-3 py-1.5 text-xs text-lychee-50 hover:bg-pomegranate-700"
                   >
                     Delete selected
@@ -912,6 +938,25 @@ export default function InspectDetail() {
               <strong className="text-lychee-100">{fmtBytes(deleteTarget.reclaim_bytes)}</strong>.
               This cannot be undone.
             </p>
+            <div className="mb-4">
+              <button
+                type="button"
+                onClick={toggleDeleteTargetList}
+                className="text-xs text-agave-400 hover:underline"
+              >
+                {showDeleteTargetList ? 'Hide' : 'Show'} the {deleteTarget.delete_count} snapshots
+              </button>
+              {showDeleteTargetList && (
+                <div className="mt-2 max-h-48 overflow-y-auto rounded-md border border-blackberry-700 bg-blackberry-950 p-2 font-mono text-xs text-lychee-400">
+                  {loadingDeleteTargetList
+                    ? 'Loading…'
+                    : (deleteTargetIds ?? []).map(id => {
+                        const row = sizeRows.find(r => r.id === id)
+                        return <div key={id}>{row ? `${row.date}  ${row.name}` : `#${id}`}</div>
+                      })}
+                </div>
+              )}
+            </div>
             <p className="mb-2 text-sm text-lychee-300">
               Type <code className="rounded bg-blackberry-800 px-1">delete {deleteTarget.delete_count} snapshots</code> to confirm:
             </p>
@@ -1026,6 +1071,23 @@ export default function InspectDetail() {
                 <span className="mt-2 block text-xs text-kumquat-500">You haven't run "Estimate combined savings" for this selection yet.</span>
               )}
             </p>
+            <div className="mb-4">
+              <button
+                type="button"
+                onClick={() => setShowSelectedList(v => !v)}
+                className="text-xs text-agave-400 hover:underline"
+              >
+                {showSelectedList ? 'Hide' : 'Show'} the {selected.size} snapshots
+              </button>
+              {showSelectedList && (
+                <div className="mt-2 max-h-48 overflow-y-auto rounded-md border border-blackberry-700 bg-blackberry-950 p-2 font-mono text-xs text-lychee-400">
+                  {Array.from(selected).map(id => {
+                    const row = sizeRows.find(r => r.id === id)
+                    return <div key={id}>{row ? `${row.date}  ${row.name}` : `#${id}`}</div>
+                  })}
+                </div>
+              )}
+            </div>
             <p className="mb-2 text-sm text-lychee-300">
               Type <code className="rounded bg-blackberry-800 px-1">delete {selected.size} snapshots</code> to confirm:
             </p>
