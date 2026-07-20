@@ -17,6 +17,7 @@ from app.auth import CurrentUser, RequireOperator
 from app.config import settings
 from app.database import SessionLocal, get_db
 from app.models import Cluster, InspectJob
+from app.qumulo.api import UnsupportedVersionError
 from app.qumulo.client import ApiError
 from app.routers.clusters import decrypt_token, get_authorized_cluster
 
@@ -31,6 +32,12 @@ CLUSTER_AUTH_ERROR_MESSAGE = (
     "This cluster's stored credentials have expired or are no longer valid. "
     "Update the cluster's credentials, then retry."
 )
+
+# Distinct from both of the above: the cluster is reachable and the credentials
+# are valid, but the Qumulo Core release itself predates the APIs/fields this
+# tool depends on (see UnsupportedVersionError) -- no amount of re-authenticating
+# fixes this, so the frontend shows it as a plain, non-actionable notice.
+UNSUPPORTED_VERSION_STATUS = 426
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +58,26 @@ def _open_cache():
     return Cache(Path(settings.cache_path))
 
 
+def _checked_cluster_name(qclient) -> str:
+    """api.get_cluster_name, but gated on the cluster meeting MIN_CORE_VERSION
+    first -- this is the first real API call every worker makes, so it's the
+    natural place to fail fast with a clear reason instead of hitting a raw
+    KeyError deep in response parsing later (e.g. a missing logical_datablocks
+    field on file attributes, which older Qumulo Core releases don't return)."""
+    from app.qumulo import api
+
+    api.check_min_version(qclient)
+    return api.get_cluster_name(qclient)
+
+
 async def _run_qumulo_worker(worker):
     """Run a sync Qumulo-calling worker in the executor, translating an expired/
-    invalid cluster token into a clean, distinguishable error instead of a 500."""
+    invalid cluster token -- or an unsupported Qumulo Core version -- into a
+    clean, distinguishable error instead of a 500."""
     try:
         return await asyncio.get_event_loop().run_in_executor(None, worker)
+    except UnsupportedVersionError as e:
+        raise HTTPException(UNSUPPORTED_VERSION_STATUS, str(e)) from e
     except ApiError as e:
         if e.status_code == 401:
             raise HTTPException(
@@ -85,7 +107,7 @@ async def refresh_snapshots(
         qclient = _make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             snaps = api.list_snapshots(qclient)
             cache.put_listing(cluster_name, [asdict(s) for s in snaps])
             return cluster_name, len(snaps)
@@ -122,7 +144,7 @@ async def get_groups(
         qclient = _make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -192,7 +214,7 @@ async def get_curve(
         qclient = _make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -276,7 +298,7 @@ async def get_snapshot_sizes(
         qclient = _make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -393,7 +415,7 @@ async def older_than(
         qclient = _make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             snaps_raw = cached or [asdict(s) for s in api.list_snapshots(qclient)]
             if cached is None:
@@ -447,7 +469,7 @@ async def start_inspect(
         from app.qumulo import api
 
         qclient = _make_qclient(cluster)
-        return api.get_cluster_name(qclient)
+        return _checked_cluster_name(qclient)
 
     cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
@@ -515,7 +537,7 @@ async def _run_inspect_task(
         )
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -543,6 +565,9 @@ async def _run_inspect_task(
                 pair_workers=settings.pair_workers,
                 include_held=include_held,
             )
+        except UnsupportedVersionError as e:
+            error_message = str(e)
+            push("error", {"message": error_message})
         except ApiError as e:
             error_message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
             push("error", {"message": error_message})
@@ -603,7 +628,7 @@ async def start_size_snapshots(
         from app.qumulo import api
 
         qclient = _make_qclient(cluster)
-        return api.get_cluster_name(qclient)
+        return _checked_cluster_name(qclient)
 
     cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
@@ -672,7 +697,7 @@ async def _run_size_snapshots_task(
         )
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -700,6 +725,9 @@ async def _run_size_snapshots_task(
                 triple_workers=settings.pair_workers,
                 include_held=include_held,
             )
+        except UnsupportedVersionError as e:
+            error_message = str(e)
+            push("error", {"message": error_message})
         except ApiError as e:
             error_message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
             push("error", {"message": error_message})
@@ -763,7 +791,7 @@ async def start_estimate_deletion(
         qclient = _make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = api.get_cluster_name(qclient)
+            cluster_name = _checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -864,6 +892,9 @@ async def _run_estimate_deletion_task(
                 observer=observer,
                 should_stop=lambda: job.done,
             )
+        except UnsupportedVersionError as e:
+            error_message = str(e)
+            push("error", {"message": error_message})
         except ApiError as e:
             error_message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
             push("error", {"message": error_message})
@@ -1017,7 +1048,7 @@ async def delete_snapshots(
             # for every subsequent Inspect/Size-snapshots/Estimate call.
             cache = _open_cache()
             try:
-                cluster_name = api.get_cluster_name(qclient)
+                cluster_name = _checked_cluster_name(qclient)
                 snaps = api.list_snapshots(qclient)
                 cache.put_listing(cluster_name, [asdict(s) for s in snaps])
             finally:

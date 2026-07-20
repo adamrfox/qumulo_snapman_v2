@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import { api, ClusterAuthError } from '../api'
+import { api, ClusterAuthError, UnsupportedClusterVersionError } from '../api'
 import type { CurvePoint, LastRun, ReclaimRow, SnapshotGroup, SnapshotSizeRow } from '../types'
 import { useAuth } from '../App'
 
@@ -123,15 +123,22 @@ export default function InspectDetail() {
   const [deleteSelectedConfirm, setDeleteSelectedConfirm] = useState('')
   const [deleteSelectedResult, setDeleteSelectedResult] = useState<{ deleted: number[]; errors: { id: number; error: string }[] } | null>(null)
   const [clusterAuthExpired, setClusterAuthExpired] = useState(false)
+  const [unsupportedVersionMessage, setUnsupportedVersionMessage] = useState<string | null>(null)
 
   useEffect(() => {
     if (!clusterId || !sourceFileId) return
     api.inspect.curve(clusterId, sourceFileId)
       .then(r => { setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs) })
-      .catch(e => { if (e instanceof ClusterAuthError) setClusterAuthExpired(true) })
+      .catch(e => {
+        if (e instanceof ClusterAuthError) setClusterAuthExpired(true)
+        if (e instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(e.message)
+      })
     api.inspect.snapshotSizes(clusterId, sourceFileId)
       .then(r => { setSizeRows(r.snapshots); setSizeLastRun(r.last_run) })
-      .catch(e => { if (e instanceof ClusterAuthError) setClusterAuthExpired(true) })
+      .catch(e => {
+        if (e instanceof ClusterAuthError) setClusterAuthExpired(true)
+        if (e instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(e.message)
+      })
   }, [clusterId, sourceFileId])
 
   async function startInspect() {
@@ -223,6 +230,7 @@ export default function InspectDetail() {
     } catch (err: unknown) {
       setRunning(false)
       if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
+      if (err instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(err.message)
       setStatusMsg(err instanceof Error ? err.message : 'Failed to start')
     }
   }
@@ -377,6 +385,7 @@ export default function InspectDetail() {
     } catch (err: unknown) {
       setSizeRunning(false)
       if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
+      if (err instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(err.message)
       setSizeStatusMsg(err instanceof Error ? err.message : 'Failed to start')
     }
   }
@@ -484,6 +493,7 @@ export default function InspectDetail() {
     } catch (err: unknown) {
       setEstimateRunning(false)
       if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
+      if (err instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(err.message)
       setEstimateStatusMsg(err instanceof Error ? err.message : 'Failed to start')
     }
   }
@@ -568,13 +578,25 @@ export default function InspectDetail() {
       </div>
 
       {clusterAuthExpired && (
-        <div className="mb-4 flex items-center justify-between rounded-md border border-pomegranate-700 bg-pomegranate-950/30 px-4 py-3 text-sm text-pomegranate-300">
+        <div className="mb-4 flex items-center justify-between rounded-md border border-pomegranate-700 bg-pomegranate-700/20 px-4 py-3 text-sm text-pomegranate-400">
           <span>This cluster's stored credentials have expired or are no longer valid.</span>
           <button
             onClick={() => navigate('/', { state: { selectedClusterId: clusterId } })}
             className="flex-shrink-0 rounded-md bg-agave-500 px-3 py-1 text-xs text-blackberry-950 hover:bg-agave-600"
           >
             Update credentials
+          </button>
+        </div>
+      )}
+
+      {unsupportedVersionMessage && (
+        <div className="mb-4 flex items-center justify-between rounded-md border border-kumquat-700 bg-kumquat-700/20 px-4 py-3 text-sm text-kumquat-400">
+          <span>{unsupportedVersionMessage}</span>
+          <button
+            onClick={() => setUnsupportedVersionMessage(null)}
+            className="flex-shrink-0 rounded-md px-3 py-1 text-xs text-lychee-300 hover:bg-blackberry-850"
+          >
+            Dismiss
           </button>
         </div>
       )}

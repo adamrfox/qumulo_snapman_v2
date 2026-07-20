@@ -4,6 +4,12 @@
 // that cluster's credentials instead.
 export class ClusterAuthError extends Error {}
 
+// Thrown when the cluster itself runs a Qumulo Core release older than this tool
+// supports (backend status 426 — "Upgrade Required"). Unlike ClusterAuthError,
+// re-entering credentials can't fix this, so it should read as a plain notice,
+// not an actionable prompt.
+export class UnsupportedClusterVersionError extends Error {}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -23,6 +29,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     } catch {}
     if (res.status === 424) {
       throw new ClusterAuthError(detail)
+    }
+    if (res.status === 426) {
+      throw new UnsupportedClusterVersionError(detail)
     }
     throw new Error(detail)
   }
@@ -45,6 +54,12 @@ export const api = {
       request('PATCH', `/api/users/${id}`, data),
     changePassword: (currentPassword: string, newPassword: string) =>
       request('POST', '/api/users/me/password', { current_password: currentPassword, new_password: newPassword }),
+  },
+  admin: {
+    getLogs: (lines = 5000) =>
+      request<{ backend_log: string; nginx_access_log: string; nginx_error_log: string }>(
+        'GET', `/api/admin/logs?lines=${lines}`
+      ),
   },
   clusters: {
     list: () => request<import('./types').Cluster[]>('GET', '/api/clusters/'),

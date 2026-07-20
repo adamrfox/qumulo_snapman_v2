@@ -7,6 +7,7 @@ services:
       ENABLE_HTTPS: "${ENABLE_HTTPS:-false}"
     volumes:
       - ./certs:/certs
+      - snapman_logs:/var/log/snapman
     depends_on:
       - backend
     restart: unless-stopped
@@ -19,8 +20,10 @@ services:
       TOKEN_ENCRYPTION_KEY: "${TOKEN_ENCRYPTION_KEY}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
       CACHE_PATH: "/data/snapman-cache.db"
+      NGINX_LOG_DIR: "/var/log/snapman"
     volumes:
       - snapman_cache:/data
+      - snapman_logs:/var/log/snapman:ro
     depends_on:
       db:
         condition: service_healthy
@@ -44,3 +47,4 @@ services:
 volumes:
   postgres_data:
   snapman_cache:
+  snapman_logs:

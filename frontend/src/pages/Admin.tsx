@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import { getConsoleLogText } from '../consoleLog'
 import type { Role, User } from '../types'
 import { useAuth } from '../App'
 
@@ -16,10 +17,49 @@ export default function Admin() {
   const [form, setForm] = useState({ username: '', password: '', role: 'viewer' as Role })
   const [createError, setCreateError] = useState('')
   const [actionError, setActionError] = useState('')
+  const [downloadingLogs, setDownloadingLogs] = useState(false)
+  const [downloadError, setDownloadError] = useState('')
 
   useEffect(() => {
     api.users.list().then(setUsers).catch(() => {})
   }, [])
+
+  async function downloadDiagnostics() {
+    setDownloadError('')
+    setDownloadingLogs(true)
+    try {
+      const { backend_log, nginx_access_log, nginx_error_log } = await api.admin.getLogs()
+      const text = [
+        `snapman diagnostics — ${new Date().toISOString()}`,
+        '',
+        '===== BACKEND LOG =====',
+        backend_log || '(empty)',
+        '',
+        '===== NGINX ACCESS LOG =====',
+        nginx_access_log || '(empty)',
+        '',
+        '===== NGINX ERROR LOG =====',
+        nginx_error_log || '(empty)',
+        '',
+        '===== BROWSER CONSOLE (this session) =====',
+        getConsoleLogText() || '(empty)',
+      ].join('\n')
+
+      const blob = new Blob([text], { type: 'text/plain' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `snapman-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.log`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (err: unknown) {
+      setDownloadError(err instanceof Error ? err.message : 'Failed to download diagnostics')
+    } finally {
+      setDownloadingLogs(false)
+    }
+  }
 
   async function createUser(e: React.FormEvent) {
     e.preventDefault()
@@ -120,6 +160,24 @@ export default function Admin() {
             ))}
           </tbody>
         </table>
+      </div>
+
+      <div className="mt-8">
+        <h2 className="mb-1 text-lg font-light text-lychee-100">Diagnostics</h2>
+        <p className="mb-3 text-sm text-lychee-400">
+          Bundle the backend log, nginx log, and this browser's console output from the current
+          session into one file to send along when reporting an issue.
+        </p>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={downloadDiagnostics}
+            disabled={downloadingLogs}
+            className="rounded-md border border-blackberry-700 px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
+          >
+            {downloadingLogs ? 'Preparing…' : 'Download diagnostics'}
+          </button>
+          {downloadError && <p className="text-sm text-pomegranate-400">{downloadError}</p>}
+        </div>
       </div>
 
       {showCreate && (

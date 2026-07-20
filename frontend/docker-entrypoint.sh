@@ -5,6 +5,8 @@ CERT_DIR=/certs
 CERT_FILE="$CERT_DIR/tls.crt"
 KEY_FILE="$CERT_DIR/tls.key"
 
+mkdir -p /var/log/snapman
+
 if [ "$ENABLE_HTTPS" = "true" ]; then
     mkdir -p "$CERT_DIR"
     if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then

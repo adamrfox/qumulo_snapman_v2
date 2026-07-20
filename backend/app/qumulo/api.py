@@ -165,6 +165,31 @@ def parse_core_version(revision_id: str) -> tuple[int, int, int] | None:
     return int(m[1]), int(m[2]), int(m[3])
 
 
+class UnsupportedVersionError(Exception):
+    def __init__(self, revision_id: str, version: tuple[int, int, int]) -> None:
+        self.revision_id = revision_id
+        self.version = version
+        minimum = ".".join(str(p) for p in MIN_CORE_VERSION)
+        actual = ".".join(str(p) for p in version)
+        super().__init__(
+            f"This cluster is running Qumulo Core {actual} ({revision_id}), which predates the "
+            f"minimum supported version ({minimum}+). The snapshot space-accounting APIs this tool "
+            "relies on (e.g. logical_datablocks on file attributes) aren't available before that release."
+        )
+
+
+def check_min_version(client: Client) -> None:
+    """Refuse clusters older than MIN_CORE_VERSION, which lack fields (e.g.
+    logical_datablocks on file attributes) this tool's byte accounting needs.
+
+    An unparseable version string passes the gate -- better to let an unusual
+    build proceed and hit the API's own error than to wrongly lock it out."""
+    revision_id = get_version(client)
+    version = parse_core_version(revision_id)
+    if version is not None and version < MIN_CORE_VERSION:
+        raise UnsupportedVersionError(revision_id, version)
+
+
 def delete_snapshot(client: Client, snapshot_id: int) -> None:
     client.request("DELETE", f"/v3/snapshots/{snapshot_id}")
 

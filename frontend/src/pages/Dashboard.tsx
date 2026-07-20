@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { api, ClusterAuthError } from '../api'
+import { api, ClusterAuthError, UnsupportedClusterVersionError } from '../api'
 import type { Cluster, SnapshotGroup } from '../types'
 
 function fmtBytes(n: number): string {
@@ -22,6 +22,7 @@ export default function Dashboard() {
   const [loadingGroups, setLoadingGroups] = useState(false)
   const [error, setError] = useState('')
   const [authExpiredClusterId, setAuthExpiredClusterId] = useState<string | null>(null)
+  const [unsupportedVersionClusterId, setUnsupportedVersionClusterId] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [olderThanDays, setOlderThanDays] = useState(90)
   const [olderThanInput, setOlderThanInput] = useState('90')
@@ -47,12 +48,14 @@ export default function Dashboard() {
     setLoadingGroups(true)
     setError('')
     setAuthExpiredClusterId(null)
+    setUnsupportedVersionClusterId(null)
     try {
       const r = await api.inspect.groups(id, days)
       setGroups(r.groups)
       setClusterName(r.cluster_name)
     } catch (e: unknown) {
       if (e instanceof ClusterAuthError) setAuthExpiredClusterId(id)
+      if (e instanceof UnsupportedClusterVersionError) setUnsupportedVersionClusterId(id)
       setError(e instanceof Error ? e.message : 'Failed to load groups')
     } finally {
       setLoadingGroups(false)
@@ -243,7 +246,7 @@ export default function Dashboard() {
 
             {loadingGroups && <p className="text-sm text-lychee-400">Loading groups…</p>}
             {authExpiredClusterId === selectedId ? (
-              <div className="mb-4 flex items-center justify-between rounded-md border border-pomegranate-700 bg-pomegranate-950/30 px-4 py-3 text-sm text-pomegranate-300">
+              <div className="mb-4 flex items-center justify-between rounded-md border border-pomegranate-700 bg-pomegranate-700/20 px-4 py-3 text-sm text-pomegranate-400">
                 <span>This cluster's stored credentials have expired or are no longer valid.</span>
                 <div className="flex flex-shrink-0 gap-2">
                   <button
@@ -262,6 +265,16 @@ export default function Dashboard() {
                     Dismiss
                   </button>
                 </div>
+              </div>
+            ) : unsupportedVersionClusterId === selectedId ? (
+              <div className="mb-4 flex items-center justify-between rounded-md border border-kumquat-700 bg-kumquat-700/20 px-4 py-3 text-sm text-kumquat-400">
+                <span>{error}</span>
+                <button
+                  onClick={() => setUnsupportedVersionClusterId(null)}
+                  className="flex-shrink-0 rounded-md px-3 py-1 text-xs text-lychee-300 hover:bg-blackberry-850"
+                >
+                  Dismiss
+                </button>
               </div>
             ) : (
               error && <p className="text-sm text-pomegranate-400">{error}</p>

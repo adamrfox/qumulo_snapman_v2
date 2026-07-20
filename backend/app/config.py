@@ -1,6 +1,7 @@
 import os
 import secrets
 import sys
+from pathlib import Path
 
 
 class Settings:
@@ -14,6 +15,12 @@ class Settings:
     _token_key: str = os.environ.get("TOKEN_ENCRYPTION_KEY", "")
     admin_password: str = os.environ.get("ADMIN_PASSWORD", "")
     cache_path: str = os.environ.get("CACHE_PATH", "/data/snapman-cache.db")
+
+    # Backend's own tee'd stdout/stderr log (app/main.py) -- same volume as
+    # cache_path, just a subdirectory, so no extra volume mount is needed.
+    log_dir: str = os.environ.get("LOG_DIR", str(Path(cache_path).parent / "logs"))
+    # Shared volume nginx writes access/error logs into (see docker-compose.yml).
+    nginx_log_dir: str = os.environ.get("NGINX_LOG_DIR", "/var/log/snapman")
 
     snapshot_listing_ttl: float = 300.0
     file_workers: int = int(os.environ.get("FILE_WORKERS", "16"))
