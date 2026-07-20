@@ -17,9 +17,20 @@ from app.auth import CurrentUser, RequireOperator
 from app.config import settings
 from app.database import SessionLocal, get_db
 from app.models import Cluster, InspectJob
+from app.qumulo.client import ApiError
 from app.routers.clusters import decrypt_token, get_authorized_cluster
 
 router = APIRouter()
+
+# Distinct from the app's own session-expiry 401 (see api.ts's global handler) so the
+# frontend can tell "your snapman login expired" apart from "this cluster's stored
+# Qumulo token expired" and prompt for fresh cluster credentials instead of logging
+# the user out of the app.
+CLUSTER_AUTH_ERROR_STATUS = 424
+CLUSTER_AUTH_ERROR_MESSAGE = (
+    "This cluster's stored credentials have expired or are no longer valid. "
+    "Update the cluster's credentials, then retry."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +49,21 @@ def _open_cache():
     from app.qumulo.cache import Cache
 
     return Cache(Path(settings.cache_path))
+
+
+async def _run_qumulo_worker(worker):
+    """Run a sync Qumulo-calling worker in the executor, translating an expired/
+    invalid cluster token into a clean, distinguishable error instead of a 500."""
+    try:
+        return await asyncio.get_event_loop().run_in_executor(None, worker)
+    except ApiError as e:
+        if e.status_code == 401:
+            raise HTTPException(
+                CLUSTER_AUTH_ERROR_STATUS,
+                "This cluster's stored credentials have expired or are no longer valid. "
+                "Update the cluster's credentials to continue.",
+            ) from e
+        raise HTTPException(502, f"Qumulo API error: {e}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +92,7 @@ async def refresh_snapshots(
         finally:
             cache.close()
 
-    cluster_name, count = await asyncio.get_event_loop().run_in_executor(None, _worker)
+    cluster_name, count = await _run_qumulo_worker(_worker)
     return {"cluster_name": cluster_name, "snapshot_count": count}
 
 
@@ -140,7 +166,7 @@ async def get_groups(
         finally:
             cache.close()
 
-    cluster_name, groups = await asyncio.get_event_loop().run_in_executor(None, _worker)
+    cluster_name, groups = await _run_qumulo_worker(_worker)
     return {"cluster_name": cluster_name, "groups": groups}
 
 
@@ -223,7 +249,7 @@ async def get_curve(
         finally:
             cache.close()
 
-    result = await asyncio.get_event_loop().run_in_executor(None, _worker)
+    result = await _run_qumulo_worker(_worker)
     if result is None:
         raise HTTPException(404, "Source not found in snapshot listing")
     return result
@@ -338,7 +364,7 @@ async def get_snapshot_sizes(
         else None
     )
 
-    result = await asyncio.get_event_loop().run_in_executor(None, _worker)
+    result = await _run_qumulo_worker(_worker)
     if result is None:
         raise HTTPException(404, "Source not found in snapshot listing")
     result["last_run"] = last_run
@@ -389,7 +415,7 @@ async def older_than(
         finally:
             cache.close()
 
-    ids = await asyncio.get_event_loop().run_in_executor(None, _worker)
+    ids = await _run_qumulo_worker(_worker)
     return {"snapshot_ids": ids, "count": len(ids)}
 
 
@@ -423,7 +449,7 @@ async def start_inspect(
         qclient = _make_qclient(cluster)
         return api.get_cluster_name(qclient)
 
-    cluster_name = await asyncio.get_event_loop().run_in_executor(None, _get_cluster_name)
+    cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
     db_job = InspectJob(
         cluster_id=cluster_id,
@@ -517,6 +543,9 @@ async def _run_inspect_task(
                 pair_workers=settings.pair_workers,
                 include_held=include_held,
             )
+        except ApiError as e:
+            error_message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
+            push("error", {"message": error_message})
         except Exception as e:
             error_message = str(e)
             push("error", {"message": error_message})
@@ -576,7 +605,7 @@ async def start_size_snapshots(
         qclient = _make_qclient(cluster)
         return api.get_cluster_name(qclient)
 
-    cluster_name = await asyncio.get_event_loop().run_in_executor(None, _get_cluster_name)
+    cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
     db_job = InspectJob(
         cluster_id=cluster_id,
@@ -671,6 +700,9 @@ async def _run_size_snapshots_task(
                 triple_workers=settings.pair_workers,
                 include_held=include_held,
             )
+        except ApiError as e:
+            error_message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
+            push("error", {"message": error_message})
         except Exception as e:
             error_message = str(e)
             push("error", {"message": error_message})
@@ -755,7 +787,7 @@ async def start_estimate_deletion(
         finally:
             cache.close()
 
-    cluster_name, runs, error = await asyncio.get_event_loop().run_in_executor(None, _prepare)
+    cluster_name, runs, error = await _run_qumulo_worker(_prepare)
     if error is not None:
         raise HTTPException(400, error)
 
@@ -832,6 +864,9 @@ async def _run_estimate_deletion_task(
                 observer=observer,
                 should_stop=lambda: job.done,
             )
+        except ApiError as e:
+            error_message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
+            push("error", {"message": error_message})
         except Exception as e:
             error_message = str(e)
             push("error", {"message": error_message})

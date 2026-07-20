@@ -106,6 +106,17 @@ class PartitionTest(unittest.TestCase):
         self.assertEqual((run1.left.id, [s.id for s in run1.deleted], run1.right.id), (0, [1, 2], 3))
         self.assertEqual((run2.left.id, [s.id for s in run2.deleted], run2.right.id), (3, [4], 5))
 
+    def test_selection_touching_oldest_has_no_left_boundary(self) -> None:
+        """A run reaching the group's actual oldest snapshot has no kept
+        snapshot before it -- left is None, not an error (there's nothing
+        before the run's start for the correction term to protect)."""
+        snaps = [_snap(i) for i in range(6)]
+        runs = partition_into_runs(snaps, {0, 1, 2})
+        self.assertEqual(len(runs), 1)
+        self.assertIsNone(runs[0].left)
+        self.assertEqual(runs[0].right.id, 3)
+        self.assertEqual([s.id for s in runs[0].deleted], [0, 1, 2])
+
 
 class ValidationTest(unittest.TestCase):
     def test_rejects_newest(self) -> None:
@@ -126,6 +137,12 @@ class ValidationTest(unittest.TestCase):
     def test_accepts_valid_middle_selection(self) -> None:
         snaps = [_snap(i) for i in range(4)]
         validate_selection(snaps, {1, 2})  # should not raise
+
+    def test_accepts_oldest_selection(self) -> None:
+        """Unlike the newest snapshot, the oldest is a valid selection --
+        the run just ends up with no left boundary (see PartitionTest)."""
+        snaps = [_snap(i) for i in range(4)]
+        validate_selection(snaps, {0, 1})  # should not raise
 
 
 class RunLengthOneMatchesThreeWayTest(unittest.TestCase):
@@ -167,6 +184,42 @@ class RunLengthOneMatchesThreeWayTest(unittest.TestCase):
 
         self.assertEqual(observer.estimate, (three_way.exclusive_bytes, True))
         self.assertEqual(three_way.exclusive_bytes, 4096)
+
+
+class OldestBoundaryTest(unittest.TestCase):
+    """The real /snap_testing/ case that motivated this: a group's two oldest
+    snapshots each show 0 for Individual size (neither is the sole owner of
+    what dies at its own pairwise step, since the older kept neighbor of the
+    *older* one straight-up doesn't exist), yet selecting them together is a
+    perfectly legal, useful question -- and the answer is just the plain sum
+    of adjacent pairwise diffs, no direct-diff correction, because there's no
+    surviving snapshot before the run that could still be holding the data."""
+
+    def test_run_touching_oldest_sums_without_a_direct_diff(self) -> None:
+        c = TestClient()
+        s1, s2, s3 = _snap(1), _snap(2), _snap(3)  # s1 is the group's oldest
+        path_a, path_b = "/data/a.bin", "/data/b.bin"
+        c.set_tree_diff(2, 1, [_t("MODIFY", path_a)])
+        c.set_tree_diff(3, 2, [_t("MODIFY", path_b)])
+        c.set_file_diff(2, 1, path_a, [_f("MODIFY", 0, 4096)])
+        c.set_file_diff(3, 2, path_b, [_f("MODIFY", 0, 8192)])
+        # Deliberately no c.set_tree_diff(3, 1, ...) registered: a direct S1<->S3
+        # diff must never be requested for this run (left is None), so if the
+        # old always-subtract behavior regressed back in, TestClient would
+        # raise on the unregistered lookup instead of this test passing.
+
+        cache = _cache()
+        observer = _RecordingObserver()
+        try:
+            run = Run(left=None, right=s3, deleted=[s1, s2])
+            run_deletion_estimate(
+                c, cache, "cluster", SRC, [run],
+                max_workers=4, observer=observer, should_stop=lambda: False,
+            )
+        finally:
+            cache.close()
+
+        self.assertEqual(observer.estimate, (4096 + 8192, True))
 
 
 class FoxDemoRegressionTest(unittest.TestCase):

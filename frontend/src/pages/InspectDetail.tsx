@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import { api } from '../api'
-import type { LastRun, ReclaimRow, SnapshotGroup, SnapshotSizeRow } from '../types'
+import { api, ClusterAuthError } from '../api'
+import type { CurvePoint, LastRun, ReclaimRow, SnapshotGroup, SnapshotSizeRow } from '../types'
 import { useAuth } from '../App'
 
 function fmtBytes(n: number | null): string {
@@ -80,6 +80,7 @@ export default function InspectDetail() {
   const [includeHeld, setIncludeHeld] = useState(false)
 
   const [rows, setRows] = useState<ReclaimRow[]>([])
+  const [points, setPoints] = useState<CurvePoint[]>([])
   const [unmeasured, setUnmeasured] = useState(0)
   const [running, setRunning] = useState(false)
   const [activePairs, setActivePairs] = useState<Record<number, ActivePairItem>>({})
@@ -121,15 +122,16 @@ export default function InspectDetail() {
   const [showDeleteSelectedModal, setShowDeleteSelectedModal] = useState(false)
   const [deleteSelectedConfirm, setDeleteSelectedConfirm] = useState('')
   const [deleteSelectedResult, setDeleteSelectedResult] = useState<{ deleted: number[]; errors: { id: number; error: string }[] } | null>(null)
+  const [clusterAuthExpired, setClusterAuthExpired] = useState(false)
 
   useEffect(() => {
     if (!clusterId || !sourceFileId) return
     api.inspect.curve(clusterId, sourceFileId)
-      .then(r => { setRows(r.rows); setUnmeasured(r.unmeasured_pairs) })
-      .catch(() => {})
+      .then(r => { setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs) })
+      .catch(e => { if (e instanceof ClusterAuthError) setClusterAuthExpired(true) })
     api.inspect.snapshotSizes(clusterId, sourceFileId)
       .then(r => { setSizeRows(r.snapshots); setSizeLastRun(r.last_run) })
-      .catch(() => {})
+      .catch(e => { if (e instanceof ClusterAuthError) setClusterAuthExpired(true) })
   }, [clusterId, sourceFileId])
 
   async function startInspect() {
@@ -199,7 +201,7 @@ export default function InspectDetail() {
             setStatusMsg('Done — reloading curve…')
             setRunSummary(skipped || errored ? { skipped, errored } : null)
             api.inspect.curve(clusterId!, sourceFileId!)
-              .then(r => { setRows(r.rows); setUnmeasured(r.unmeasured_pairs); setStatusMsg('') })
+              .then(r => { setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs); setStatusMsg('') })
             break
           case 'error':
             es.close()
@@ -220,6 +222,7 @@ export default function InspectDetail() {
       }
     } catch (err: unknown) {
       setRunning(false)
+      if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
       setStatusMsg(err instanceof Error ? err.message : 'Failed to start')
     }
   }
@@ -238,6 +241,7 @@ export default function InspectDetail() {
         api.inspect.curve(clusterId, sourceFileId)
           .then(r => {
             setRows(r.rows)
+            setPoints(r.points)
             setUnmeasured(r.unmeasured_pairs)
             setStatusMsg('Stopped. Progress so far is saved — click Inspect again to resume.')
           })
@@ -372,6 +376,7 @@ export default function InspectDetail() {
       }
     } catch (err: unknown) {
       setSizeRunning(false)
+      if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
       setSizeStatusMsg(err instanceof Error ? err.message : 'Failed to start')
     }
   }
@@ -478,6 +483,7 @@ export default function InspectDetail() {
       }
     } catch (err: unknown) {
       setEstimateRunning(false)
+      if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
       setEstimateStatusMsg(err instanceof Error ? err.message : 'Failed to start')
     }
   }
@@ -493,6 +499,16 @@ export default function InspectDetail() {
   }
 
   const canDelete = user?.role === 'admin' || user?.role === 'operator'
+
+  // The curve only shows a row where it can name an unambiguous "delete before
+  // this date" cutoff -- i.e. somewhere an older/newer pair fall on different
+  // calendar days. A burst of same-day snapshots can be fully measured (every
+  // pair cached, unmeasured === 0) and still produce zero rows, because there's
+  // no date boundary to express. Without this check that reads identically to
+  // "Inspect hasn't been run yet."
+  const curveFullyMeasured = points.length > 0 && unmeasured === 0
+  const curveHasNoExpressibleRow = curveFullyMeasured && rows.length === 0
+  const curveTotalBytes = points.length > 0 ? points[points.length - 1].cumulative_bytes : null
 
   return (
     <div className="p-6">
@@ -550,6 +566,18 @@ export default function InspectDetail() {
           </div>
         </div>
       </div>
+
+      {clusterAuthExpired && (
+        <div className="mb-4 flex items-center justify-between rounded-md border border-pomegranate-700 bg-pomegranate-950/30 px-4 py-3 text-sm text-pomegranate-300">
+          <span>This cluster's stored credentials have expired or are no longer valid.</span>
+          <button
+            onClick={() => navigate('/', { state: { selectedClusterId: clusterId } })}
+            className="flex-shrink-0 rounded-md bg-agave-500 px-3 py-1 text-xs text-blackberry-950 hover:bg-agave-600"
+          >
+            Update credentials
+          </button>
+        </div>
+      )}
 
       {/* Progress */}
       {running && (
@@ -683,9 +711,29 @@ export default function InspectDetail() {
         </div>
       )}
 
-      {rows.length === 0 && !running && (
+      {rows.length === 0 && !running && curveHasNoExpressibleRow && (
+        <div className="rounded-lg border border-blackberry-700 bg-blackberry-900 p-6 text-sm text-lychee-400">
+          <p className="mb-2">
+            All {points.length + 1} snapshots in this tree were measured — every consecutive pair
+            was taken on the same calendar day as its neighbor, so there's no unambiguous
+            "delete everything before this date" cutoff to show as a row here.
+          </p>
+          <p>
+            Deleting every snapshot shown below except the newest would free approximately{' '}
+            <strong className="text-kiwi-400">{fmtBytesExact(curveTotalBytes ?? 0)}</strong>. To
+            verify that number or act on it, check all of them except the newest in the Snapshot
+            sizes table below and click "Estimate combined savings" (or skip straight to "Delete
+            selected") — checking just one at a time there will usually show much less, since most
+            of what a same-day burst of snapshots holds is still shared with its neighbors.
+          </p>
+        </div>
+      )}
+
+      {rows.length === 0 && !running && !curveHasNoExpressibleRow && (
         <div className="rounded-lg border border-blackberry-700 bg-blackberry-900 p-8 text-center text-sm text-lychee-500">
-          No measurements yet — click Inspect to start
+          {points.length === 0
+            ? 'No measurements yet — click Inspect to start'
+            : `Still measuring — ${points.length - unmeasured} of ${points.length} pairs done so far. Click Re-inspect to continue.`}
         </div>
       )}
 

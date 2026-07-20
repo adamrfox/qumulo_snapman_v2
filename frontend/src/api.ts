@@ -1,3 +1,9 @@
+// Thrown when a cluster's *stored Qumulo token* has expired or been revoked (backend
+// status 424) — distinct from the app's own session-expiry 401, which the global
+// handler below turns into a full logout. This one should prompt the user to update
+// that cluster's credentials instead.
+export class ClusterAuthError extends Error {}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -15,6 +21,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       const data = await res.json()
       detail = data.detail ?? detail
     } catch {}
+    if (res.status === 424) {
+      throw new ClusterAuthError(detail)
+    }
     throw new Error(detail)
   }
   if (res.status === 204) return undefined as T

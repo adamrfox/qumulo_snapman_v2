@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { api } from '../api'
+import { api, ClusterAuthError } from '../api'
 import type { Cluster, SnapshotGroup } from '../types'
 
 function fmtBytes(n: number): string {
@@ -21,6 +21,7 @@ export default function Dashboard() {
   const [clusterName, setClusterName] = useState('')
   const [loadingGroups, setLoadingGroups] = useState(false)
   const [error, setError] = useState('')
+  const [authExpiredClusterId, setAuthExpiredClusterId] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [olderThanDays, setOlderThanDays] = useState(90)
   const [olderThanInput, setOlderThanInput] = useState('90')
@@ -42,14 +43,25 @@ export default function Dashboard() {
     api.clusters.list().then(setClusters).catch(() => {})
   }, [])
 
-  useEffect(() => {
-    if (!selectedId) return
+  async function loadGroups(id: string, days: number) {
     setLoadingGroups(true)
     setError('')
-    api.inspect.groups(selectedId, olderThanDays)
-      .then(r => { setGroups(r.groups); setClusterName(r.cluster_name) })
-      .catch(e => setError(e.message))
-      .finally(() => setLoadingGroups(false))
+    setAuthExpiredClusterId(null)
+    try {
+      const r = await api.inspect.groups(id, days)
+      setGroups(r.groups)
+      setClusterName(r.cluster_name)
+    } catch (e: unknown) {
+      if (e instanceof ClusterAuthError) setAuthExpiredClusterId(id)
+      setError(e instanceof Error ? e.message : 'Failed to load groups')
+    } finally {
+      setLoadingGroups(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedId) return
+    loadGroups(selectedId, olderThanDays)
   }, [selectedId, olderThanDays])
 
   function commitOlderThan() {
@@ -64,13 +76,11 @@ export default function Dashboard() {
   async function refreshCluster() {
     if (!selectedId) return
     setRefreshing(true)
-    setError('')
     try {
       await api.clusters.refresh(selectedId)
-      const r = await api.inspect.groups(selectedId, olderThanDays)
-      setGroups(r.groups)
-      setClusterName(r.cluster_name)
+      await loadGroups(selectedId, olderThanDays)
     } catch (err: unknown) {
+      if (err instanceof ClusterAuthError) setAuthExpiredClusterId(selectedId)
       setError(err instanceof Error ? err.message : 'Failed to refresh')
     } finally {
       setRefreshing(false)
@@ -121,6 +131,9 @@ export default function Dashboard() {
       const updated = await api.clusters.update(editingCluster.id, payload)
       setClusters(prev => prev.map(c => c.id === updated.id ? updated : c))
       setEditingCluster(null)
+      if (updated.id === selectedId) {
+        loadGroups(selectedId, olderThanDays)
+      }
     } catch (err: unknown) {
       setEditError(err instanceof Error ? err.message : 'Failed to update cluster')
     }
@@ -229,7 +242,30 @@ export default function Dashboard() {
             </div>
 
             {loadingGroups && <p className="text-sm text-lychee-400">Loading groups…</p>}
-            {error && <p className="text-sm text-pomegranate-400">{error}</p>}
+            {authExpiredClusterId === selectedId ? (
+              <div className="mb-4 flex items-center justify-between rounded-md border border-pomegranate-700 bg-pomegranate-950/30 px-4 py-3 text-sm text-pomegranate-300">
+                <span>This cluster's stored credentials have expired or are no longer valid.</span>
+                <div className="flex flex-shrink-0 gap-2">
+                  <button
+                    onClick={() => {
+                      const c = clusters.find(x => x.id === selectedId)
+                      if (c) openEdit(c)
+                    }}
+                    className="rounded-md bg-agave-500 px-3 py-1 text-xs text-blackberry-950 hover:bg-agave-600"
+                  >
+                    Update credentials
+                  </button>
+                  <button
+                    onClick={() => setAuthExpiredClusterId(null)}
+                    className="rounded-md px-3 py-1 text-xs text-lychee-300 hover:bg-blackberry-850"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            ) : (
+              error && <p className="text-sm text-pomegranate-400">{error}</p>
+            )}
 
             {!loadingGroups && !error && groups.length > 0 && (
               <div className="overflow-x-auto rounded-lg border border-blackberry-700 bg-blackberry-900 shadow-md">
@@ -258,12 +294,16 @@ export default function Dashboard() {
                           <td className="px-4 py-3 text-right">{g.max_age_days}d</td>
                           <td className="px-4 py-3 text-right">{g.prunable}</td>
                           <td className="px-4 py-3 text-right">
-                            {g.total_pairs > 0
+                            {g.prunable === 0
+                              ? <span className="text-lychee-500" title="Nothing in this tree is older than the cutoff yet, so there's nothing prunable to measure a percentage of.">n/a</span>
+                              : g.total_pairs > 0
                               ? `${Math.round((g.measured_pairs / g.total_pairs) * 100)}%`
                               : '—'}
                           </td>
                           <td className="px-4 py-3 text-right font-medium">
-                            {g.reclaim_bytes > 0
+                            {g.prunable === 0
+                              ? <span className="text-lychee-500" title="Nothing in this tree is older than the cutoff yet — this isn't the same as unmeasured. Open the tree and check Snapshot sizes for what's been measured so far.">n/a</span>
+                              : g.reclaim_bytes > 0
                               ? <span className="text-kiwi-400">{g.is_upper_bound ? '≤ ' : ''}{fmtBytes(g.reclaim_bytes)}</span>
                               : g.measured_pairs === 0
                               ? <span className="text-lychee-500">not measured</span>

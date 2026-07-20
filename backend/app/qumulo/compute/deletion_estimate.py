@@ -27,6 +27,16 @@ strict generalization, not a competing formula.
 Runs never share data with each other (a kept boundary sits between any
 two runs), so totals across runs simply add -- no new math needed there.
 
+Edge case: a run can reach all the way back to the group's actual oldest
+snapshot, in which case there's no L to serve as a boundary -- Run.left is
+None, and freed(run) is just the plain adjacent-chain sum with no
+subtraction. This is legal (unlike touching the newest snapshot, which is
+never legal -- there's no live-filesystem diff to compare it against): with
+no L, there's nothing before the run that could still be holding the data
+alive, so every byte the adjacent-chain sum counts is genuinely freed. This
+mirrors why the oldest snapshot's individual size already reuses the plain
+pairwise number instead of a three-way diff.
+
 No new diff engine: both terms are just calls to the existing
 compute_pair_contribution, cached in the existing pair_contribution table
 (keyed by (cluster_name, source_file_id, older_id, newer_id) already --
@@ -55,12 +65,16 @@ StopFn = Callable[[], bool]
 
 @dataclass(frozen=True)
 class Run:
-    left: Snapshot
+    # None means the run reaches all the way back to the group's actual oldest
+    # snapshot -- there's no kept snapshot before it to serve as a boundary.
+    left: Snapshot | None
     right: Snapshot
     deleted: list[Snapshot]
 
     @property
     def chain(self) -> list[Snapshot]:
+        if self.left is None:
+            return [*self.deleted, self.right]
         return [self.left, *self.deleted, self.right]
 
     @property
@@ -69,7 +83,14 @@ class Run:
         return list(zip(chain[:-1], chain[1:]))
 
     @property
-    def direct_pair(self) -> tuple[Snapshot, Snapshot]:
+    def direct_pair(self) -> tuple[Snapshot, Snapshot] | None:
+        # No left boundary means no correction term: everything that dies
+        # anywhere in the run is genuinely freed, since there's nothing
+        # before the run to still be holding onto it (same reasoning as why
+        # the oldest snapshot's individual size reuses the plain pairwise
+        # number instead of a three-way diff).
+        if self.left is None:
+            return None
         return (self.left, self.right)
 
 
@@ -95,14 +116,17 @@ def partition_into_runs(snapshots_sorted: list[Snapshot], selected_ids: set[int]
         while i < n and snapshots_sorted[i].id in selected_ids:
             i += 1
         end = i - 1
-        if start == 0 or end == n - 1:
+        if end == n - 1:
             raise SelectionError(
-                "Selection must not include the oldest or newest snapshot in the group "
-                "without a kept neighbor on both sides."
+                "Selection must not include the newest snapshot -- there's no later "
+                "snapshot to diff against."
             )
+        # A run reaching all the way back to the group's actual oldest
+        # snapshot has no kept left boundary -- that's fine, see Run.direct_pair.
+        left = snapshots_sorted[start - 1] if start > 0 else None
         runs.append(
             Run(
-                left=snapshots_sorted[start - 1],
+                left=left,
                 right=snapshots_sorted[end + 1],
                 deleted=snapshots_sorted[start : end + 1],
             )
@@ -147,7 +171,8 @@ class WebDeletionEstimateObserver:
             {
                 "run_index": run_index,
                 "total_runs": total_runs,
-                "left_id": run.left.id, "left_name": run.left.name,
+                "left_id": run.left.id if run.left is not None else None,
+                "left_name": run.left.name if run.left is not None else None,
                 "right_id": run.right.id, "right_name": run.right.name,
                 "deleted_ids": [s.id for s in run.deleted],
                 "deleted_names": [s.name for s in run.deleted],
@@ -203,7 +228,10 @@ def run_deletion_estimate(
     work: list[tuple[Snapshot, Snapshot]] = []
     seen: set[tuple[int, int]] = set()
     for run in runs:
-        for older, newer in [*run.adjacent_pairs, run.direct_pair]:
+        needed = [*run.adjacent_pairs]
+        if run.direct_pair is not None:
+            needed.append(run.direct_pair)
+        for older, newer in needed:
             key = (older.id, newer.id)
             if key not in seen:
                 seen.add(key)
@@ -268,16 +296,21 @@ def run_deletion_estimate(
                 run_error = (entry[1] if entry else "not computed") or "not computed"
                 break
             adjacent_sum += entry[0]
-        direct_entry = results.get((run.direct_pair[0].id, run.direct_pair[1].id))
-        if run_error is None and (direct_entry is None or direct_entry[1] is not None):
-            run_error = (direct_entry[1] if direct_entry else "not computed") or "not computed"
+        direct_freed = 0
+        direct_pair = run.direct_pair
+        if direct_pair is not None:
+            direct_entry = results.get((direct_pair[0].id, direct_pair[1].id))
+            if run_error is None and (direct_entry is None or direct_entry[1] is not None):
+                run_error = (direct_entry[1] if direct_entry else "not computed") or "not computed"
+            elif direct_entry is not None:
+                direct_freed = direct_entry[0]
 
         if run_error is not None:
             complete = False
             observer.run_result(i, None, run_error)
             continue
 
-        freed = adjacent_sum - direct_entry[0]
+        freed = adjacent_sum - direct_freed
         grand_total += freed
         observer.run_result(i, freed, None)
 
