@@ -3,6 +3,10 @@ services:
     build: ./frontend
     ports:
       - "${APP_PORT:-3003}:80"
+    environment:
+      ENABLE_HTTPS: "${ENABLE_HTTPS:-false}"
+    volumes:
+      - ./certs:/certs
     depends_on:
       - backend
     restart: unless-stopped

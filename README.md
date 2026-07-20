@@ -239,6 +239,30 @@ username/password, which the app exchanges for a session token server-side.
 Database migrations run automatically on container start
 (`alembic upgrade head`, see the backend `CMD`).
 
+### HTTPS
+
+Off by default (plain HTTP). To serve the web UI over HTTPS instead, set
+`ENABLE_HTTPS=true` in `.env` and restart:
+
+```sh
+docker compose up -d
+```
+
+It still serves on the same `APP_PORT` — only the protocol changes, so
+`https://localhost:3003` instead of `http://`; plain HTTP requests to that port
+are rejected once HTTPS is on, not silently allowed alongside it.
+
+To use your own certificate (recommended for anything customer-facing), place
+`tls.crt` and `tls.key` in a `./certs` directory next to `docker-compose.yml`
+*before* starting the container. If that directory is empty when
+`ENABLE_HTTPS=true`, the frontend container generates a self-signed cert into
+it automatically on first start (logged clearly to `docker compose logs
+frontend`) and reuses that same cert on every subsequent restart — fine for
+eval/internal use, but browsers will show a certificate warning until it's
+replaced with one from a real CA. Note the self-signed cert (or the entrypoint
+script itself) writes into `./certs` as root, so removing that directory later
+may require `sudo` or an equivalent privileged cleanup.
+
 ## Development
 
 ```sh
