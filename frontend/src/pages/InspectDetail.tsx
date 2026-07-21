@@ -113,6 +113,10 @@ export default function InspectDetail() {
   const sizeJobIdRef = useRef<string | null>(null)
   const sizeCancelRequestedRef = useRef(false)
 
+  const [sizeFilterMode, setSizeFilterMode] = useState<'days' | 'date'>('days')
+  const [sizeFilterDays, setSizeFilterDays] = useState('')
+  const [sizeFilterDate, setSizeFilterDate] = useState('')
+
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [estimateRunning, setEstimateRunning] = useState(false)
   const [estimateStatusMsg, setEstimateStatusMsg] = useState('')
@@ -454,6 +458,33 @@ export default function InspectDetail() {
     setEstimateResult(null)
   }
 
+  function toggleSelectAll() {
+    const selectableIds = filteredSizeRows.filter(r => r.status !== 'not_sizable' && !r.held).map(r => r.id)
+    setSelected(prev => {
+      const allSelected = selectableIds.length > 0 && selectableIds.every(id => prev.has(id))
+      return allSelected ? new Set() : new Set(selectableIds)
+    })
+    setEstimateResult(null)
+  }
+
+  const sizeFilterDaysNum = sizeFilterDays.trim() === '' ? null : Number(sizeFilterDays)
+  const filteredSizeRows = sizeRows.filter(r => {
+    if (sizeFilterMode === 'days') {
+      return sizeFilterDaysNum === null || Number.isNaN(sizeFilterDaysNum) || r.age_days > sizeFilterDaysNum
+    }
+    return sizeFilterDate === '' || r.date < sizeFilterDate
+  })
+
+  const selectableSizeRowIds = filteredSizeRows.filter(r => r.status !== 'not_sizable' && !r.held).map(r => r.id)
+  const allSizeRowsSelected = selectableSizeRowIds.length > 0 && selectableSizeRowIds.every(id => selected.has(id))
+  const someSizeRowsSelected = selectableSizeRowIds.some(id => selected.has(id))
+  const selectAllRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = someSizeRowsSelected && !allSizeRowsSelected
+    }
+  }, [someSizeRowsSelected, allSizeRowsSelected])
+
   async function startEstimate() {
     if (!clusterId || !sourceFileId || selected.size === 0) return
     setEstimateRunning(true)
@@ -791,11 +822,71 @@ export default function InspectDetail() {
           <div className="border-b border-blackberry-700 px-4 py-3">
             <h3 className="text-sm font-medium text-lychee-100">Snapshot sizes</h3>
             <p className="text-xs text-lychee-500">How much deleting just that one snapshot alone would free. Check multiple to see what deleting them together would free.</p>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <div className="flex gap-1 rounded-md border border-blackberry-700 bg-blackberry-800 p-1 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setSizeFilterMode('days')}
+                  className={`rounded px-2 py-1 ${sizeFilterMode === 'days' ? 'bg-agave-500 text-blackberry-950' : 'text-lychee-300 hover:bg-blackberry-850'}`}
+                >
+                  Older than (days)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSizeFilterMode('date')}
+                  className={`rounded px-2 py-1 ${sizeFilterMode === 'date' ? 'bg-agave-500 text-blackberry-950' : 'text-lychee-300 hover:bg-blackberry-850'}`}
+                >
+                  Before date
+                </button>
+              </div>
+              {sizeFilterMode === 'days' ? (
+                <input
+                  type="number"
+                  min={0}
+                  value={sizeFilterDays}
+                  onChange={e => setSizeFilterDays(e.target.value)}
+                  placeholder="e.g. 30"
+                  className="w-24 rounded-md border border-blackberry-700 bg-blackberry-800 px-2 py-1 text-xs text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                />
+              ) : (
+                <input
+                  type="date"
+                  value={sizeFilterDate}
+                  onChange={e => setSizeFilterDate(e.target.value)}
+                  className="rounded-md border border-blackberry-700 bg-blackberry-800 px-2 py-1 text-xs text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+                />
+              )}
+              {((sizeFilterMode === 'days' && sizeFilterDays.trim() !== '') || (sizeFilterMode === 'date' && sizeFilterDate !== '')) && (
+                <button
+                  type="button"
+                  onClick={() => { setSizeFilterDays(''); setSizeFilterDate('') }}
+                  className="text-xs text-agave-400 hover:underline"
+                >
+                  Clear filter
+                </button>
+              )}
+              {filteredSizeRows.length !== sizeRows.length && (
+                <span className="text-xs text-lychee-500">
+                  Showing {filteredSizeRows.length} of {sizeRows.length} snapshots
+                </span>
+              )}
+            </div>
           </div>
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-blackberry-700 bg-blackberry-800 text-left text-xs font-medium uppercase text-lychee-100">
-                {canDelete && <th className="px-4 py-3"></th>}
+                {canDelete && (
+                  <th className="px-4 py-3">
+                    <input
+                      ref={selectAllRef}
+                      type="checkbox"
+                      checked={allSizeRowsSelected}
+                      disabled={selectableSizeRowIds.length === 0}
+                      onChange={toggleSelectAll}
+                      title="Select all"
+                    />
+                  </th>
+                )}
                 <th className="px-4 py-3">Snapshot</th>
                 <th className="px-4 py-3 text-right">Age</th>
                 <th className="px-4 py-3 text-right">Individual size</th>
@@ -803,7 +894,7 @@ export default function InspectDetail() {
               </tr>
             </thead>
             <tbody className="divide-y divide-blackberry-700">
-              {sizeRows.map(r => {
+              {filteredSizeRows.map(r => {
                 const unselectable = r.status === 'not_sizable' || r.held
                 return (
                   <tr key={r.id} className="text-lychee-300 hover:bg-blackberry-850">
@@ -846,6 +937,13 @@ export default function InspectDetail() {
                   </tr>
                 )
               })}
+              {filteredSizeRows.length === 0 && (
+                <tr>
+                  <td colSpan={canDelete ? 5 : 3} className="px-4 py-6 text-center text-xs text-lychee-500">
+                    No snapshots match this filter.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
           {sizeLastRun?.status === 'error' && (
