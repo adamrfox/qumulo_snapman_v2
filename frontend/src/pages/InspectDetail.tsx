@@ -467,6 +467,8 @@ export default function InspectDetail() {
     setEstimateResult(null)
   }
 
+  const cumulativeByOlderId = new Map(points.map(p => [p.older_id, p]))
+
   const sizeFilterDaysNum = sizeFilterDays.trim() === '' ? null : Number(sizeFilterDays)
   const filteredSizeRows = sizeRows.filter(r => {
     if (sizeFilterMode === 'days') {
@@ -890,6 +892,12 @@ export default function InspectDetail() {
                 <th className="px-4 py-3">Snapshot</th>
                 <th className="px-4 py-3 text-right">Age</th>
                 <th className="px-4 py-3 text-right">Individual size</th>
+                <th
+                  className="px-4 py-3 text-right"
+                  title="Space freed if you deleted this snapshot and every older one, keeping this snapshot's next-newer neighbor onward"
+                >
+                  Cumulative reclaim
+                </th>
                 {canDelete && <th className="px-4 py-3"></th>}
               </tr>
             </thead>
@@ -922,6 +930,18 @@ export default function InspectDetail() {
                         {sizeStatusLabel(r).text}
                       </span>
                     </td>
+                    <td className="px-4 py-3 text-right font-medium text-kiwi-400">
+                      {(() => {
+                        const point = cumulativeByOlderId.get(r.id)
+                        if (!point) {
+                          return <span className="text-lychee-500" title="No later snapshot to compare against">—</span>
+                        }
+                        if (point.cumulative_bytes === null) {
+                          return <span className="text-lychee-500" title="Not yet measured — run Inspect to compute the reclaim curve">—</span>
+                        }
+                        return fmtBytesExact(point.cumulative_bytes)
+                      })()}
+                    </td>
                     {canDelete && (
                       <td className="px-4 py-3 text-right">
                         <button
@@ -939,7 +959,7 @@ export default function InspectDetail() {
               })}
               {filteredSizeRows.length === 0 && (
                 <tr>
-                  <td colSpan={canDelete ? 5 : 3} className="px-4 py-6 text-center text-xs text-lychee-500">
+                  <td colSpan={canDelete ? 6 : 4} className="px-4 py-6 text-center text-xs text-lychee-500">
                     No snapshots match this filter.
                   </td>
                 </tr>
