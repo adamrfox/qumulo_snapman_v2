@@ -72,6 +72,42 @@ def reclaim_rows(
     return rows, len(points) - len(sized)
 
 
+def build_points(
+    snaps_sorted: Sequence[Snapshot],
+    pairs: dict[tuple[int, int], tuple[int, int]],
+    now: datetime,
+) -> tuple[list[dict], int]:
+    """Build a curve's points from a tree's snapshots (sorted oldest-to-newest)
+    and its cached per-pair (freed_bytes, total_files) results. Mirrors the
+    original inline loop in the /curve endpoint -- cumulative stops
+    accumulating (None) once the first unmeasured pair is hit, since a
+    cumulative total that silently skipped an unmeasured gap would be wrong,
+    not just incomplete."""
+    curve = CurveModel(now)
+    cumulative = 0
+    known = True
+    for older, newer in zip(snaps_sorted[:-1], snaps_sorted[1:]):
+        pair_data = pairs.get((older.id, newer.id))
+        if pair_data is None:
+            known = False
+            curve.add(older, newer, None, None, None, cached=False, pending=True)
+        else:
+            freed, files = pair_data
+            if known:
+                cumulative += freed
+            curve.add(
+                older,
+                newer,
+                freed,
+                cumulative if known else None,
+                files,
+                cached=True,
+                pending=False,
+            )
+    unmeasured = sum(1 for p in curve.points if p["status"] in ("pending", "timed_out"))
+    return curve.points, unmeasured
+
+
 class CurveModel:
     def __init__(self, now: datetime) -> None:
         self._now = now

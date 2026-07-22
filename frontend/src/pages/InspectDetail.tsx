@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { api, ClusterAuthError, UnsupportedClusterVersionError } from '../api'
-import type { CurvePoint, LastRun, ReclaimRow, SnapshotGroup, SnapshotSizeRow } from '../types'
+import type { CurvePoint, GoalReturnState, LastRun, ReclaimRow, SnapshotGroup, SnapshotSizeRow } from '../types'
 import { useAuth } from '../App'
 
 function fmtBytes(n: number | null): string {
@@ -76,6 +76,7 @@ export default function InspectDetail() {
 
   const group: SnapshotGroup | undefined = location.state?.group
   const clusterName: string = location.state?.clusterName ?? ''
+  const goalReturn: GoalReturnState | undefined = location.state?.goalReturn
 
   const [includeHeld, setIncludeHeld] = useState(false)
 
@@ -94,6 +95,22 @@ export default function InspectDetail() {
   const [deleteTargetIds, setDeleteTargetIds] = useState<number[] | null>(null)
   const [showDeleteTargetList, setShowDeleteTargetList] = useState(false)
   const [loadingDeleteTargetList, setLoadingDeleteTargetList] = useState(false)
+
+  // Arriving here from the goal solver's "Review & delete" pre-fills and
+  // opens this exact confirmation modal instead of the results screen
+  // inventing its own bulk-delete action -- every delete still needs its own
+  // explicit confirmation, tree by tree, same as clicking a curve row here.
+  useEffect(() => {
+    const recommended: ReclaimRow | undefined = location.state?.recommendedTarget
+    if (recommended) {
+      setDeleteTarget(recommended)
+      setDeleteConfirm('')
+      setDeleteTargetIds(null)
+      setShowDeleteTargetList(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const esRef = useRef<EventSource | null>(null)
   const jobIdRef = useRef<string | null>(null)
   const cancelRequestedRef = useRef(false)
@@ -282,6 +299,30 @@ export default function InspectDetail() {
     setShowDeleteTargetList(true)
   }
 
+  // Whether we got here via the goal solver's "Review & delete" -- if so,
+  // cancelling or confirming this modal should return to that same solved
+  // plan (updated with what just happened) instead of leaving the user
+  // stranded on this tree's page with no way back but a fresh re-solve.
+  function returnToPlan(handled: boolean) {
+    if (!goalReturn || !sourceFileId) return
+    const handledIds = new Set(goalReturn.handledIds)
+    if (handled) handledIds.add(sourceFileId)
+    navigate('/', {
+      state: {
+        selectedClusterId: clusterId,
+        reopenGoal: { ...goalReturn, handledIds: Array.from(handledIds) },
+      },
+    })
+  }
+
+  function cancelDeleteTarget() {
+    setDeleteTarget(null)
+    setDeleteConfirm('')
+    setDeleteTargetIds(null)
+    setShowDeleteTargetList(false)
+    returnToPlan(false)
+  }
+
   async function doDelete() {
     if (!clusterId || !deleteTarget || !sourceFileId) return
     // Reuse the ids already fetched for the optional list, if the user looked at
@@ -293,6 +334,7 @@ export default function InspectDetail() {
     setDeleteTarget(null)
     setDeleteTargetIds(null)
     setShowDeleteTargetList(false)
+    returnToPlan(true)
   }
 
   async function startSizeSnapshots() {
@@ -1086,7 +1128,7 @@ export default function InspectDetail() {
             />
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setDeleteTarget(null)}
+                onClick={cancelDeleteTarget}
                 className="rounded-md px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850"
               >
                 Cancel

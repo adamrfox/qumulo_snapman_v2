@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { api, ClusterAuthError, UnsupportedClusterVersionError } from '../api'
-import type { Cluster, SnapshotGroup } from '../types'
+import type { Cluster, GoalReturnState, SnapshotGroup } from '../types'
+import GoalModal from './GoalModal'
 
 function fmtBytes(n: number): string {
   if (n === 0) return '—'
@@ -26,6 +27,19 @@ export default function Dashboard() {
   const [refreshing, setRefreshing] = useState(false)
   const [olderThanDays, setOlderThanDays] = useState(90)
   const [olderThanInput, setOlderThanInput] = useState('90')
+  const [selectedTrees, setSelectedTrees] = useState<Set<string>>(new Set())
+  const [showGoalModal, setShowGoalModal] = useState(false)
+  const [reopenGoal, setReopenGoal] = useState<GoalReturnState | null>(null)
+
+  useEffect(() => {
+    const reopen: GoalReturnState | undefined = location.state?.reopenGoal
+    if (reopen) {
+      setReopenGoal(reopen)
+      setSelectedTrees(new Set(reopen.groups.map(g => g.source_file_id)))
+      setShowGoalModal(true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const [showAddCluster, setShowAddCluster] = useState(false)
   const [authMode, setAuthMode] = useState<'token' | 'credentials'>('credentials')
   const [form, setForm] = useState({
@@ -66,6 +80,35 @@ export default function Dashboard() {
     if (!selectedId) return
     loadGroups(selectedId, olderThanDays)
   }, [selectedId, olderThanDays])
+
+  useEffect(() => {
+    setSelectedTrees(new Set())
+  }, [selectedId])
+
+  function toggleTree(sourceFileId: string) {
+    setSelectedTrees(prev => {
+      const next = new Set(prev)
+      if (next.has(sourceFileId)) next.delete(sourceFileId)
+      else next.add(sourceFileId)
+      return next
+    })
+  }
+
+  function toggleSelectAllTrees() {
+    setSelectedTrees(prev => {
+      const allSelected = groups.length > 0 && groups.every(g => prev.has(g.source_file_id))
+      return allSelected ? new Set() : new Set(groups.map(g => g.source_file_id))
+    })
+  }
+
+  const allTreesSelected = groups.length > 0 && groups.every(g => selectedTrees.has(g.source_file_id))
+  const someTreesSelected = groups.some(g => selectedTrees.has(g.source_file_id))
+  const selectAllTreesRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (selectAllTreesRef.current) {
+      selectAllTreesRef.current.indeterminate = someTreesSelected && !allTreesSelected
+    }
+  }, [someTreesSelected, allTreesSelected])
 
   function commitOlderThan() {
     const n = Number(olderThanInput)
@@ -241,6 +284,14 @@ export default function Dashboard() {
                 >
                   {refreshing ? 'Refreshing…' : 'Refresh'}
                 </button>
+                <button
+                  onClick={() => setShowGoalModal(true)}
+                  disabled={selectedTrees.size === 0}
+                  title={selectedTrees.size === 0 ? 'Check one or more trees below first' : undefined}
+                  className="rounded-md bg-agave-500 px-3 py-1.5 text-xs text-blackberry-950 hover:bg-agave-600 disabled:opacity-40"
+                >
+                  Solve for a space goal{selectedTrees.size > 0 ? ` (${selectedTrees.size})` : ''}
+                </button>
               </div>
             </div>
 
@@ -285,6 +336,16 @@ export default function Dashboard() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-blackberry-700 bg-blackberry-800 text-left text-xs font-medium uppercase text-lychee-100">
+                      <th className="px-4 py-3">
+                        <input
+                          ref={selectAllTreesRef}
+                          type="checkbox"
+                          checked={allTreesSelected}
+                          disabled={groups.length === 0}
+                          onChange={toggleSelectAllTrees}
+                          title="Select all"
+                        />
+                      </th>
                       <th className="px-4 py-3">Path</th>
                       <th className="px-4 py-3 text-right">Snaps</th>
                       <th className="px-4 py-3 text-right">Oldest</th>
@@ -302,6 +363,13 @@ export default function Dashboard() {
                           onClick={() => navigate(`/cluster/${selectedId}/inspect/${g.source_file_id}`, { state: { group: g, clusterName } })}
                           className="cursor-pointer text-lychee-300 hover:bg-blackberry-850"
                         >
+                          <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={selectedTrees.has(g.source_file_id)}
+                              onChange={() => toggleTree(g.source_file_id)}
+                            />
+                          </td>
                           <td className="px-4 py-3 font-mono text-xs">{g.path}</td>
                           <td className="px-4 py-3 text-right">{g.count.toLocaleString()}</td>
                           <td className="px-4 py-3 text-right">{g.max_age_days}d</td>
@@ -560,6 +628,23 @@ export default function Dashboard() {
             </form>
           </div>
         </div>
+      )}
+
+      {showGoalModal && selectedId && (
+        <GoalModal
+          clusterId={selectedId}
+          clusterName={clusterName}
+          groups={reopenGoal ? reopenGoal.groups : groups.filter(g => selectedTrees.has(g.source_file_id))}
+          initialResult={reopenGoal?.result}
+          initialSkipped={reopenGoal?.skipped}
+          initialHandledIds={reopenGoal?.handledIds}
+          onClose={() => { setShowGoalModal(false); setReopenGoal(null) }}
+          onDeselect={sourceFileId => setSelectedTrees(prev => {
+            const next = new Set(prev)
+            next.delete(sourceFileId)
+            return next
+          })}
+        />
       )}
     </div>
   )

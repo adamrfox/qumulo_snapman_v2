@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -208,7 +209,7 @@ async def get_curve(
 
     def _worker():
         from app.qumulo import api
-        from app.qumulo.compute.curve import CurveModel, reclaim_rows
+        from app.qumulo.compute.curve import build_points, reclaim_rows
         from app.qumulo.compute.groups import group_snapshots
 
         qclient = _make_qclient(cluster)
@@ -230,33 +231,19 @@ async def get_curve(
 
             pairs = cache.get_pairs(cluster_name, source_file_id)
             snaps_sorted = sorted(group.snapshots, key=lambda s: s.id)
-            curve = CurveModel(now)
-            cumulative = 0
-            known = True
-            for older, newer in zip(snaps_sorted[:-1], snaps_sorted[1:]):
-                pair_data = pairs.get((older.id, newer.id))
-                if pair_data is None:
-                    known = False
-                    curve.add(older, newer, None, None, None, cached=False, pending=True)
-                else:
-                    freed, files = pair_data
-                    if known:
-                        cumulative += freed
-                    curve.add(
-                        older,
-                        newer,
-                        freed,
-                        cumulative if known else None,
-                        files,
-                        cached=True,
-                        pending=False,
-                    )
+            points, _ = build_points(snaps_sorted, pairs, now)
 
-            rows, unmeasured = reclaim_rows(curve.points)
+            # reclaim_rows' own unmeasured count (points from the first gap
+            # onward, conservative for bucketing) is what the frontend's
+            # "still measuring" progress messaging keys off -- keep using it
+            # here rather than build_points' plain total-pending count, which
+            # the goal orchestrator uses instead (it only cares whether that
+            # count is exactly zero, where the two formulas always agree).
+            rows, unmeasured = reclaim_rows(points)
             return {
                 "cluster_name": cluster_name,
                 "source_file_id": source_file_id,
-                "points": curve.points,
+                "points": points,
                 "rows": [
                     {
                         "keep_days": r[0],
@@ -473,12 +460,47 @@ async def start_inspect(
 
     cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
+    cluster_snapshot = {
+        "host": cluster.host,
+        "port": cluster.port,
+        "token_encrypted": cluster.token_encrypted,
+        "insecure": cluster.insecure,
+    }
+    job = await launch_inspect_job(
+        db,
+        cluster_id,
+        cluster_name,
+        cluster_snapshot,
+        req.source_file_id,
+        req.path,
+        user.id,
+        req.include_held,
+    )
+
+    return {"job_id": job.id, "reused": False}
+
+
+async def launch_inspect_job(
+    db: AsyncSession,
+    cluster_id: str,
+    cluster_name: str,
+    cluster_snapshot: dict,
+    source_file_id: str,
+    path: str,
+    started_by: str,
+    include_held: bool = False,
+) -> job_registry.InspectJob:
+    """Create the durable inspect_jobs row + in-memory registry entry and
+    launch _run_inspect_task -- the same sequence start_inspect uses, shared
+    with the goal orchestrator so a tree it auto-inspects is a first-class,
+    independently-visible Inspect job like any other (found by find_running,
+    watchable from that tree's own detail page, etc.)."""
     db_job = InspectJob(
         cluster_id=cluster_id,
         cluster_name=cluster_name,
-        source_file_id=req.source_file_id,
-        path=req.path,
-        started_by=user.id,
+        source_file_id=source_file_id,
+        path=path,
+        started_by=started_by,
         status="running",
     )
     db.add(db_job)
@@ -489,23 +511,14 @@ async def start_inspect(
         job_id=db_job.id,
         cluster_id=cluster_id,
         cluster_name=cluster_name,
-        source_file_id=req.source_file_id,
-        path=req.path,
-        started_by=user.id,
+        source_file_id=source_file_id,
+        path=path,
+        started_by=started_by,
     )
-
-    cluster_snapshot = {
-        "host": cluster.host,
-        "port": cluster.port,
-        "token_encrypted": cluster.token_encrypted,
-        "insecure": cluster.insecure,
-    }
-    task = asyncio.create_task(
-        _run_inspect_task(job, cluster_snapshot, req.source_file_id, req.path, req.include_held)
+    job.task = asyncio.create_task(
+        _run_inspect_task(job, cluster_snapshot, source_file_id, path, include_held)
     )
-    job.task = task
-
-    return {"job_id": job.id, "reused": False}
+    return job
 
 
 async def _run_inspect_task(
@@ -597,6 +610,262 @@ async def _run_inspect_task(
                     db_job.status = "completed"
                 db_job.finished_at = datetime.utcnow()
                 await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# POST /{cluster_id}/goal — cluster-wide space-recovery goal solver
+# ---------------------------------------------------------------------------
+
+
+class GoalRequest(BaseModel):
+    source_file_ids: list[str]
+    target_bytes: int
+
+
+@router.post("/{cluster_id}/goal", status_code=202)
+async def start_goal(
+    cluster_id: str,
+    req: GoalRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    cluster = await get_authorized_cluster(cluster_id, user, db)
+    if not req.source_file_ids:
+        raise HTTPException(400, "source_file_ids must not be empty")
+
+    def _get_cluster_name():
+        qclient = _make_qclient(cluster)
+        return _checked_cluster_name(qclient)
+
+    cluster_name = await _run_qumulo_worker(_get_cluster_name)
+
+    # Ephemeral, in-memory-only job -- unlike a regular Inspect job this one
+    # spans many trees, which doesn't fit the inspect_jobs table's one-job-
+    # one-tree schema (source_file_id is NOT NULL there). Nothing expensive is
+    # lost if the process restarts mid-run: any real Inspect work this job
+    # triggers along the way gets its own durable row via launch_inspect_job,
+    # so the user just re-solves and picks up the cached results for free.
+    job = job_registry.create(
+        job_id=str(uuid.uuid4()),
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        source_file_id="*",
+        path="*",
+        started_by=user.id,
+        job_type="goal",
+    )
+
+    cluster_snapshot = {
+        "host": cluster.host,
+        "port": cluster.port,
+        "token_encrypted": cluster.token_encrypted,
+        "insecure": cluster.insecure,
+    }
+    job.task = asyncio.create_task(
+        _run_goal_task(
+            job,
+            cluster_snapshot,
+            cluster_id,
+            cluster_name,
+            req.source_file_ids,
+            req.target_bytes,
+            user.id,
+        )
+    )
+    return {"job_id": job.id}
+
+
+async def _run_goal_task(
+    job: job_registry.InspectJob,
+    cluster_snapshot: dict,
+    cluster_id: str,
+    cluster_name: str,
+    source_file_ids: list[str],
+    target_bytes: int,
+    started_by: str,
+) -> None:
+    from app.qumulo.compute.goal import TreeInput, allocate
+
+    loop = asyncio.get_event_loop()
+    error_message: str | None = None
+
+    def push(event_type: str, data: dict) -> None:
+        loop.call_soon_threadsafe(job.event_queue.put_nowait, {"type": event_type, **data})
+
+    def _load_tree(sfid: str) -> dict | None:
+        """Cache-only aside from a possible listing refresh / one-time path
+        lookup (same cost profile as GET /groups): this tree's path, its
+        current points + unmeasured-pair count, and a cheap prunable count
+        used only to decide run order."""
+        from app.qumulo import api, paths
+        from app.qumulo.client import QumuloClient
+        from app.qumulo.compute.curve import build_points
+        from app.qumulo.compute.groups import group_snapshots, prune_prefix
+
+        token = decrypt_token(cluster_snapshot["token_encrypted"])
+        qclient = QumuloClient(
+            cluster_snapshot["host"],
+            cluster_snapshot["port"],
+            token,
+            insecure=cluster_snapshot["insecure"],
+        )
+        cache = _open_cache()
+        try:
+            cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
+            if cached is None:
+                snaps = api.list_snapshots(qclient)
+                cache.put_listing(cluster_name, [asdict(s) for s in snaps])
+            else:
+                snaps = [api.Snapshot.from_json(d) for d in cached]
+            now = datetime.now(timezone.utc)
+            group = next(
+                (g for g in group_snapshots(snaps, now) if g.source_file_id == sfid), None
+            )
+            if group is None:
+                return None
+            path = paths.resolve_source_path(
+                qclient, cache, cluster_name, sfid, group.snapshots[-1].id
+            )
+            pairs = cache.get_pairs(cluster_name, sfid)
+            snaps_sorted = sorted(group.snapshots, key=lambda s: s.id)
+            points, unmeasured = build_points(snaps_sorted, pairs, now)
+            prunable = prune_prefix(group, now, 0).prunable
+
+            # If an unmeasured pair's older snapshot is locked/replication-held,
+            # that's *why* -- Inspect skips held snapshots by default (their
+            # size isn't actionable since they can't be deleted anyway), and
+            # that skip is never cached, so this tree can never reach 0
+            # unmeasured through an ordinary auto-inspect no matter how many
+            # times it's retried. Surface that instead of a generic "still
+            # incomplete" message so it's clear this isn't transient.
+            held_reason = None
+            if unmeasured > 0:
+                snaps_by_id = {s.id: s for s in group.snapshots}
+                for p in points:
+                    if p["status"] in ("pending", "timed_out"):
+                        snap = snaps_by_id.get(p["older_id"])
+                        if snap is not None and snap.held:
+                            held_reason = snap.held_reason
+                            break
+
+            return {
+                "path": path,
+                "points": points,
+                "unmeasured": unmeasured,
+                "prunable": prunable,
+                "held_reason": held_reason,
+            }
+        finally:
+            cache.close()
+
+    try:
+        loaded: dict[str, dict] = {}
+        for sfid in source_file_ids:
+            info = await loop.run_in_executor(None, _load_tree, sfid)
+            if info is not None:
+                loaded[sfid] = info
+
+        # Order is UX-only (biggest wins surface first, the heaviest scans
+        # happen first so a cancel loses the least) -- it never affects the
+        # final allocation, which only runs once every tree is measured.
+        ordered = sorted(loaded, key=lambda sfid: loaded[sfid]["prunable"], reverse=True)
+        total = len(ordered)
+        tree_inputs: list[TreeInput] = []
+        skipped: list[dict] = []
+
+        for index, sfid in enumerate(ordered):
+            if job.done:
+                break
+            info = loaded[sfid]
+            push(
+                "tree_start",
+                {"source_file_id": sfid, "path": info["path"], "index": index, "total": total},
+            )
+
+            if info["unmeasured"] > 0:
+                # Trees run strictly one at a time -- this is the one part of
+                # this feature that does new, potentially heavy live Qumulo
+                # work, and nothing else in this app runs more than one such
+                # scan concurrently.
+                existing = job_registry.find_running(cluster_id, sfid)
+                if existing is not None:
+                    # Don't drain another consumer's queue -- another tab may
+                    # already be watching this Inspect run.
+                    while not existing.done:
+                        push("inspect_progress", {"source_file_id": sfid, "waiting": True})
+                        await asyncio.sleep(2)
+                        if job.done:
+                            break
+                else:
+                    async with SessionLocal() as sub_db:
+                        sub_job = await launch_inspect_job(
+                            sub_db,
+                            cluster_id,
+                            cluster_name,
+                            cluster_snapshot,
+                            sfid,
+                            info["path"],
+                            started_by,
+                        )
+                    while True:
+                        if job.done:
+                            # Cancelling the goal run aborts whatever sub-
+                            # inspect is in flight too. Both flags matter:
+                            # .done actually stops run_inspect (should_stop),
+                            # .cancel_requested is what its own finally block
+                            # reads to record "cancelled" instead of
+                            # "completed" in the durable inspect_jobs row.
+                            sub_job.cancel_requested = True
+                            sub_job.done = True
+                        try:
+                            event = await asyncio.wait_for(
+                                sub_job.event_queue.get(), timeout=1.5
+                            )
+                            # Nested, not spread -- the sub-event has its own
+                            # "type" key (pair_start/progress/finish/...) that
+                            # would otherwise collide with and overwrite this
+                            # wrapper event's own "type": "inspect_progress".
+                            push("inspect_progress", {"source_file_id": sfid, "event": event})
+                            if event.get("type") in ("finish", "error"):
+                                break
+                        except asyncio.TimeoutError:
+                            pass
+                        if sub_job.done and sub_job.event_queue.empty():
+                            break
+
+                info = await loop.run_in_executor(None, _load_tree, sfid)
+
+            if info is None or info["unmeasured"] > 0:
+                held_reason = info.get("held_reason") if info else None
+                if held_reason:
+                    reason = (
+                        f'Contains a {held_reason} snapshot, which Inspect skips by default '
+                        f'since it can\'t actually be deleted. Re-inspect this tree directly '
+                        f'with "Include locked/replication-held snapshots" checked to have it '
+                        f'counted here.'
+                    )
+                else:
+                    reason = "Inspect did not finish measuring every pair -- see the backend log for details."
+                push("tree_skipped", {"source_file_id": sfid, "reason": reason})
+                skipped.append({"source_file_id": sfid, "reason": reason})
+                continue
+
+            push("tree_measured", {"source_file_id": sfid})
+            tree_inputs.append(TreeInput(sfid, info["points"]))
+
+        result = allocate(target_bytes, tree_inputs)
+        push("finish", {"result": asdict(result), "skipped": skipped})
+    except UnsupportedVersionError as e:
+        error_message = str(e)
+        push("error", {"message": error_message})
+    except ApiError as e:
+        error_message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
+        push("error", {"message": error_message})
+    except Exception as e:
+        error_message = str(e)
+        push("error", {"message": error_message})
+    finally:
+        job.done = True
 
 
 # ---------------------------------------------------------------------------

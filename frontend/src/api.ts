@@ -120,5 +120,9 @@ export const api = {
       request<{ deleted: number[]; errors: { id: number; error: string }[] }>(
         'POST', `/api/clusters/${clusterId}/snapshots/delete`, { snapshot_ids: snapshotIds }
       ),
+    startGoal: (clusterId: string, sourceFileIds: string[], targetBytes: number) =>
+      request<{ job_id: string }>(
+        'POST', `/api/clusters/${clusterId}/goal`, { source_file_ids: sourceFileIds, target_bytes: targetBytes }
+      ),
   },
 }

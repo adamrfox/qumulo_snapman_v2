@@ -68,6 +68,41 @@ export interface LastRun {
   finished_at: string | null
 }
 
+export interface TreeAllocation {
+  source_file_id: string
+  deepest_index: number | null
+  delete_snapshot_ids: number[]
+  keep_days: number | null
+  delete_before: string | null
+  delete_count: number
+  reclaim_bytes: number
+  days_sacrificed: number
+}
+
+export interface GoalResult {
+  goal_met: boolean
+  target_bytes: number
+  total_freed_bytes: number
+  shortfall: number
+  allocations: TreeAllocation[]
+}
+
+export interface GoalSkippedTree {
+  source_file_id: string
+  reason: string
+}
+
+// Carried through router state from the goal solver's results screen to a
+// tree's detail page and back, so cancelling or confirming a "Review &
+// delete" round trip returns to the same solved plan (updated with which
+// trees have been handled) instead of a blank input screen.
+export interface GoalReturnState {
+  groups: SnapshotGroup[]
+  result: GoalResult
+  skipped: GoalSkippedTree[]
+  handledIds: string[]
+}
+
 export interface User {
   id: string
   username: string
