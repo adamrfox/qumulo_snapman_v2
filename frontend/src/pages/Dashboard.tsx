@@ -670,6 +670,7 @@ export default function Dashboard() {
           initialResult={reopenGoal?.result}
           initialSkipped={reopenGoal?.skipped}
           initialHandledIds={reopenGoal?.handledIds}
+          initialExcludedIds={reopenGoal?.excludedIds}
           onClose={() => { setShowGoalModal(false); setReopenGoal(null) }}
           onDeselect={sourceFileId => setSelectedTrees(prev => {
             const next = new Set(prev)

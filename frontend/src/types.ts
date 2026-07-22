@@ -101,6 +101,7 @@ export interface GoalReturnState {
   result: GoalResult
   skipped: GoalSkippedTree[]
   handledIds: string[]
+  excludedIds: string[]
 }
 
 export interface User {

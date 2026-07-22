@@ -39,13 +39,14 @@ interface Props {
   initialResult?: GoalResult
   initialSkipped?: GoalSkippedTree[]
   initialHandledIds?: string[]
+  initialExcludedIds?: string[]
 }
 
 type Phase = 'input' | 'running' | 'results'
 
 export default function GoalModal({
   clusterId, clusterName, groups, onClose, onDeselect,
-  initialResult, initialSkipped, initialHandledIds,
+  initialResult, initialSkipped, initialHandledIds, initialExcludedIds,
 }: Props) {
   const navigate = useNavigate()
   const [phase, setPhase] = useState<Phase>(initialResult ? 'results' : 'input')
@@ -59,6 +60,12 @@ export default function GoalModal({
   const [skipped, setSkipped] = useState<GoalSkippedTree[]>(initialSkipped ?? [])
   const [result, setResult] = useState<GoalResult | null>(initialResult ?? null)
   const [handledIds, setHandledIds] = useState<Set<string>>(new Set(initialHandledIds ?? []))
+  // Trees deliberately excluded from consideration via "Try a different
+  // combination" (see tryDifferentCombination below) -- kept separate from
+  // handledIds (already deleted) and from the plain multi-select in
+  // Dashboard.tsx (which trees to consider at all).
+  const [excludedIds, setExcludedIds] = useState<Set<string>>(new Set(initialExcludedIds ?? []))
+  const [noMoreAlternatives, setNoMoreAlternatives] = useState(false)
   const esRef = useRef<EventSource | null>(null)
   const jobIdRef = useRef<string | null>(null)
 
@@ -90,16 +97,27 @@ export default function GoalModal({
     return Math.round(n * UNITS[unit])
   }
 
-  async function solve() {
+  // alternativeExcluded === null means this is a fresh solve from the input
+  // screen (resets everything). Non-null means this is a "try a different
+  // combination" attempt: the previous successful result/skipped/excludedIds
+  // are only replaced if this attempt *also* meets the goal -- a failed
+  // attempt just reports that no alternative was found and leaves the
+  // last-known-good plan on screen untouched.
+  async function runSolve(sourceFileIds: string[], alternativeExcluded: Set<string> | null) {
     const bytes = targetBytes()
     if (bytes === null) {
       setError('Enter a positive amount')
       return
     }
+    const previousSkipped = skipped
     setError('')
-    setSkipped([])
-    setResult(null)
-    setHandledIds(new Set())
+    if (alternativeExcluded === null) {
+      setSkipped([])
+      setResult(null)
+      setHandledIds(new Set())
+      setExcludedIds(new Set())
+      setNoMoreAlternatives(false)
+    }
     setCurrentTree(null)
     setPairProgress(null)
     setSubProgress(null)
@@ -107,7 +125,7 @@ export default function GoalModal({
     setStatusMsg('Starting…')
 
     try {
-      const { job_id } = await api.inspect.startGoal(clusterId, groups.map(g => g.source_file_id), bytes)
+      const { job_id } = await api.inspect.startGoal(clusterId, sourceFileIds, bytes)
       jobIdRef.current = job_id
       const es = new EventSource(`/api/clusters/${clusterId}/jobs/${job_id}/stream`, { withCredentials: true })
       esRef.current = es
@@ -147,33 +165,68 @@ export default function GoalModal({
             break
           case 'finish':
             es.close()
+            if (alternativeExcluded !== null && !msg.result.goal_met) {
+              // This alternative doesn't reach the goal -- keep showing the
+              // last successful plan (result/skipped untouched) and stop
+              // offering further alternatives rather than replacing a working
+              // plan with a worse, incomplete one.
+              setSkipped(previousSkipped)
+              setNoMoreAlternatives(true)
+              setPhase('results')
+              break
+            }
             setResult(msg.result)
+            if (alternativeExcluded !== null) setExcludedIds(alternativeExcluded)
             setPhase('results')
             break
           case 'error':
             es.close()
-            setPhase('input')
+            setPhase(alternativeExcluded !== null ? 'results' : 'input')
             setError(msg.message)
             break
         }
       }
       es.onerror = () => {
         es.close()
-        setPhase('input')
+        setPhase(alternativeExcluded !== null ? 'results' : 'input')
         setError('Stream disconnected.')
       }
     } catch (err: unknown) {
-      setPhase('input')
+      setPhase(alternativeExcluded !== null ? 'results' : 'input')
       if (err instanceof ClusterAuthError) setError(err.message)
       else if (err instanceof UnsupportedClusterVersionError) setError(err.message)
       else setError(err instanceof Error ? err.message : 'Failed to start')
     }
   }
 
+  function solve() {
+    runSolve(groups.map(g => g.source_file_id), null)
+  }
+
+  function biggestContributor(): string | null {
+    if (!result) return null
+    const used = result.allocations.filter(a => a.deepest_index !== null)
+    if (used.length === 0) return null
+    return used.reduce((max, a) => (a.reclaim_bytes > max.reclaim_bytes ? a : max)).source_file_id
+  }
+
+  function tryDifferentCombination() {
+    const biggest = biggestContributor()
+    if (!biggest) return
+    const nextExcluded = new Set(excludedIds)
+    nextExcluded.add(biggest)
+    const sourceFileIds = groups
+      .filter(g => !nextExcluded.has(g.source_file_id))
+      .map(g => g.source_file_id)
+    runSolve(sourceFileIds, nextExcluded)
+  }
+
   function stop() {
     esRef.current?.close()
     if (jobIdRef.current) api.inspect.cancelInspect(clusterId, jobIdRef.current).catch(() => {})
-    setPhase('input')
+    // Cancelling a "try a different combination" attempt should fall back to
+    // the last successful plan, not all the way back to a blank input form.
+    setPhase(result ? 'results' : 'input')
     setStatusMsg('')
   }
 
@@ -194,7 +247,7 @@ export default function GoalModal({
         // So cancelling or confirming the delete on that page returns here
         // to this same solved plan (updated with what got handled) instead
         // of a blank input screen.
-        goalReturn: { groups, result, skipped, handledIds: Array.from(handledIds) },
+        goalReturn: { groups, result, skipped, handledIds: Array.from(handledIds), excludedIds: Array.from(excludedIds) },
       },
     })
   }
@@ -334,6 +387,12 @@ export default function GoalModal({
                 : <>Fell short by <strong>{fmtBytes(result.shortfall)}</strong> — only <strong>{fmtBytes(result.total_freed_bytes)}</strong> reclaimable from the trees considered.</>}
             </div>
 
+            {excludedIds.size > 0 && (
+              <p className="mb-4 text-xs text-lychee-500">
+                Excluded from consideration (via "Try a different combination"): {Array.from(excludedIds).map(pathFor).join(', ')}
+              </p>
+            )}
+
             {skipped.length > 0 && (
               <div className="mb-4 space-y-1">
                 <p className="text-xs font-medium text-pomegranate-400">Not counted:</p>
@@ -396,10 +455,28 @@ export default function GoalModal({
               </table>
             </div>
 
-            <div className="flex justify-end">
-              <button onClick={onClose} className="rounded-md px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850">
-                Close
-              </button>
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs text-lychee-500">
+                {noMoreAlternatives && (
+                  <span title="Excluding one more tree from the current plan can no longer reach the goal.">
+                    No further alternative found.
+                  </span>
+                )}
+              </div>
+              <div className="flex gap-2">
+                {result.goal_met && !noMoreAlternatives && (
+                  <button
+                    onClick={tryDifferentCombination}
+                    title="Exclude this plan's biggest contributor and re-solve with what's left, to see if the goal is still reachable another way"
+                    className="rounded-md border border-blackberry-700 px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850"
+                  >
+                    Try a different combination
+                  </button>
+                )}
+                <button onClick={onClose} className="rounded-md px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850">
+                  Close
+                </button>
+              </div>
             </div>
           </>
         )}
