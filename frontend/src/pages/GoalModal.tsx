@@ -54,6 +54,7 @@ export default function GoalModal({
   const [error, setError] = useState('')
   const [statusMsg, setStatusMsg] = useState('')
   const [currentTree, setCurrentTree] = useState<{ index: number; total: number; path: string } | null>(null)
+  const [pairProgress, setPairProgress] = useState<{ current: number; total: number } | null>(null)
   const [subProgress, setSubProgress] = useState<{ found: number; sized: number } | null>(null)
   const [skipped, setSkipped] = useState<GoalSkippedTree[]>(initialSkipped ?? [])
   const [result, setResult] = useState<GoalResult | null>(initialResult ?? null)
@@ -100,6 +101,7 @@ export default function GoalModal({
     setResult(null)
     setHandledIds(new Set())
     setCurrentTree(null)
+    setPairProgress(null)
     setSubProgress(null)
     setPhase('running')
     setStatusMsg('Starting…')
@@ -115,6 +117,7 @@ export default function GoalModal({
         switch (msg.type) {
           case 'tree_start':
             setCurrentTree({ index: msg.index, total: msg.total, path: msg.path })
+            setPairProgress(null)
             setSubProgress(null)
             setStatusMsg(`Checking tree ${msg.index + 1} of ${msg.total}…`)
             break
@@ -129,9 +132,17 @@ export default function GoalModal({
               setStatusMsg('Waiting for an in-progress Inspect run on this tree…')
             } else if (msg.event?.type === 'pair_start') {
               setStatusMsg(`Inspecting — measuring ${msg.event.total} pairs…`)
+              // index/total are the pair's position among *all* pairs in this
+              // tree (including already-cached ones from a prior run), so
+              // this stays accurate even when resuming a partially-measured
+              // tree -- unlike the candidate-file count below, the total here
+              // never changes mid-run.
+              setPairProgress({ current: msg.event.index, total: msg.event.total })
               setSubProgress({ found: 0, sized: 0 })
             } else if (msg.event?.type === 'progress') {
               setSubProgress({ found: msg.event.found, sized: msg.event.sized })
+            } else if (msg.event?.type === 'pair_finished') {
+              setPairProgress(prev => prev ? { ...prev, current: msg.event.index } : prev)
             }
             break
           case 'finish':
@@ -288,6 +299,9 @@ export default function GoalModal({
               <div className="mb-4 rounded-md border border-blackberry-700 bg-blackberry-925 p-3 text-xs">
                 <p className="font-mono text-lychee-300">{currentTree.path}</p>
                 <p className="mt-1 text-lychee-500">Tree {currentTree.index + 1} of {currentTree.total}</p>
+                {pairProgress && (
+                  <p className="mt-1 text-lychee-500">Pair {pairProgress.current} of {pairProgress.total}</p>
+                )}
                 {subProgress && (
                   <p className="mt-1 text-lychee-500">{subProgress.sized} of {subProgress.found} candidate files sized so far</p>
                 )}
