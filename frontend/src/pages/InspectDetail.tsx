@@ -129,6 +129,7 @@ export default function InspectDetail() {
   const sizeEsRef = useRef<EventSource | null>(null)
   const sizeJobIdRef = useRef<string | null>(null)
   const sizeCancelRequestedRef = useRef(false)
+  const chainToSizeRef = useRef(false)
 
   const [sizeFilterMode, setSizeFilterMode] = useState<'days' | 'date'>('days')
   const [sizeFilterDays, setSizeFilterDays] = useState('')
@@ -233,17 +234,28 @@ export default function InspectDetail() {
             setStatusMsg('Done — reloading curve…')
             setRunSummary(skipped || errored ? { skipped, errored } : null)
             api.inspect.curve(clusterId!, sourceFileId!)
-              .then(r => { setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs); setStatusMsg('') })
+              .then(r => {
+                setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs); setStatusMsg('')
+                if (chainToSizeRef.current) {
+                  chainToSizeRef.current = false
+                  startSizeSnapshots()
+                }
+              })
             break
           case 'error':
             es.close()
             setRunning(false)
             setStatusMsg(`Error: ${msg.message}`)
+            chainToSizeRef.current = false
             break
           case 'no_curve':
             es.close()
             setRunning(false)
             setStatusMsg('Only one snapshot — nothing to measure.')
+            if (chainToSizeRef.current) {
+              chainToSizeRef.current = false
+              startSizeSnapshots()
+            }
             break
         }
       }
@@ -251,18 +263,26 @@ export default function InspectDetail() {
         es.close()
         setRunning(false)
         setStatusMsg('Stream disconnected.')
+        chainToSizeRef.current = false
       }
     } catch (err: unknown) {
       setRunning(false)
+      chainToSizeRef.current = false
       if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
       if (err instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(err.message)
       setStatusMsg(err instanceof Error ? err.message : 'Failed to start')
     }
   }
 
+  function startRefreshAll() {
+    chainToSizeRef.current = true
+    startInspect()
+  }
+
   function stopInspect() {
     esRef.current?.close()
     cancelRequestedRef.current = true
+    chainToSizeRef.current = false
     setRunning(false)
     setStatusMsg('Stopping…')
 
@@ -644,16 +664,28 @@ export default function InspectDetail() {
             Include locked/replication-held snapshots
           </label>
           <div className="flex gap-2">
+          {!running && !sizeRunning && (
+            <button
+              onClick={startRefreshAll}
+              title="Runs both Inspect and Size snapshots, so every column on this page has current data."
+              className="rounded-md bg-agave-500 px-4 py-1.5 text-sm text-blackberry-950 hover:bg-agave-600"
+            >
+              Refresh all
+            </button>
+          )}
           {!running ? (
             <button
               onClick={startInspect}
-              className="rounded-md bg-agave-500 px-4 py-1.5 text-sm text-blackberry-950 hover:bg-agave-600"
+              disabled={sizeRunning}
+              title="Diffs each pair of consecutive snapshots to build the reclaim curve — how much space you'd free cutting at each point in history."
+              className="rounded-md border border-agave-500 px-4 py-1.5 text-sm text-agave-400 hover:bg-blackberry-850 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {rows.length > 0 ? 'Re-inspect' : 'Inspect'}
             </button>
           ) : (
             <button
               onClick={stopInspect}
+              title="Cancels the running Inspect job. Progress made so far is saved."
               className="rounded-md bg-kumquat-500 px-4 py-1.5 text-sm text-blackberry-950 hover:bg-kumquat-600"
             >
               Stop
@@ -662,13 +694,16 @@ export default function InspectDetail() {
           {!sizeRunning ? (
             <button
               onClick={startSizeSnapshots}
-              className="rounded-md border border-agave-500 px-4 py-1.5 text-sm text-agave-400 hover:bg-blackberry-850"
+              disabled={running}
+              title="Computes each snapshot's own individual space usage."
+              className="rounded-md border border-agave-500 px-4 py-1.5 text-sm text-agave-400 hover:bg-blackberry-850 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {sizeRows.some(r => r.status === 'computed') ? 'Re-size snapshots' : 'Size snapshots'}
             </button>
           ) : (
             <button
               onClick={stopSizeSnapshots}
+              title="Cancels the running Size snapshots job. Progress made so far is saved."
               className="rounded-md border border-kumquat-500 px-4 py-1.5 text-sm text-kumquat-500 hover:bg-blackberry-850"
             >
               Stop
