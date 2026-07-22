@@ -11,6 +11,16 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
+def to_utc_iso(dt: datetime) -> str:
+    """Every datetime column here is naive but stores UTC (via datetime.utcnow()
+    defaults) -- serializing with plain .isoformat() drops that fact, so a
+    browser's `new Date(...)` parses the string as local time and displays a
+    value that's numerically UTC but mislabeled as local. Appending the UTC
+    designator lets the frontend convert correctly to the viewer's actual
+    local time."""
+    return dt.isoformat() + "Z"
+
+
 class User(Base):
     __tablename__ = "users"
 

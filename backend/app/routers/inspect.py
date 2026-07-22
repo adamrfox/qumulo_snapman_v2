@@ -17,7 +17,7 @@ from app import jobs as job_registry
 from app.auth import CurrentUser, RequireOperator
 from app.config import settings
 from app.database import SessionLocal, get_db
-from app.models import Cluster, InspectJob, WarmTree
+from app.models import Cluster, InspectJob, WarmTree, to_utc_iso
 from app.qumulo.api import UnsupportedVersionError
 from app.qumulo.client import ApiError
 from app.routers.clusters import decrypt_token, get_authorized_cluster
@@ -329,7 +329,7 @@ async def get_curve(
         {
             "status": last_job.status,
             "error_message": last_job.error_message,
-            "finished_at": last_job.finished_at.isoformat() if last_job.finished_at else None,
+            "finished_at": to_utc_iso(last_job.finished_at) if last_job.finished_at else None,
         }
         if last_job is not None
         else None
@@ -445,7 +445,7 @@ async def get_snapshot_sizes(
         {
             "status": last_job.status,
             "error_message": last_job.error_message,
-            "finished_at": last_job.finished_at.isoformat() if last_job.finished_at else None,
+            "finished_at": to_utc_iso(last_job.finished_at) if last_job.finished_at else None,
         }
         if last_job is not None
         else None
@@ -1384,8 +1384,8 @@ async def get_job(
         "id": db_job.id,
         "path": db_job.path,
         "status": db_job.status,
-        "started_at": db_job.started_at.isoformat(),
-        "finished_at": db_job.finished_at.isoformat() if db_job.finished_at else None,
+        "started_at": to_utc_iso(db_job.started_at),
+        "finished_at": to_utc_iso(db_job.finished_at) if db_job.finished_at else None,
         "error_message": db_job.error_message,
     }
 

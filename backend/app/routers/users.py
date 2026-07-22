@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CurrentUser, RequireAdmin, hash_password, verify_password
 from app.database import get_db
-from app.models import User
+from app.models import User, to_utc_iso
 
 router = APIRouter()
 
@@ -18,7 +18,7 @@ def _serialize(u: User) -> dict:
         "username": u.username,
         "role": u.role,
         "is_active": u.is_active,
-        "created_at": u.created_at.isoformat(),
+        "created_at": to_utc_iso(u.created_at),
     }
 
 

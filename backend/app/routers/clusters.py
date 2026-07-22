@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import CurrentUser
 from app.config import settings
 from app.database import get_db
-from app.models import Cluster, User
+from app.models import Cluster, User, to_utc_iso
 from app.qumulo.client import ApiError, login as qumulo_login
 
 router = APIRouter()
@@ -21,7 +21,7 @@ def _serialize(c: Cluster, owner_username: str | None = None) -> dict:
         "host": c.host,
         "port": c.port,
         "insecure": c.insecure,
-        "created_at": c.created_at.isoformat(),
+        "created_at": to_utc_iso(c.created_at),
         "owner_id": c.owner_id,
     }
     if owner_username is not None:
