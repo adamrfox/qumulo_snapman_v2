@@ -14,6 +14,12 @@ import httpx
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 0.5
 
+# Network-level failures (DNS blips, connection resets) get a longer, capped
+# backoff than 5xx responses -- they're often transient host/resolver hiccups
+# lasting several seconds, longer than a 500 is usually worth waiting out.
+NETWORK_MAX_RETRIES = 6
+NETWORK_RETRY_MAX_DELAY = 8.0
+
 
 class Client(Protocol):
     def request(self, method: str, path: str, body: dict | None = None) -> dict: ...
@@ -55,8 +61,9 @@ class QumuloClient:
         )
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict:
-        last_err: Exception | None = None
-        for attempt in range(MAX_RETRIES + 1):
+        http_attempt = 0
+        network_attempt = 0
+        while True:
             try:
                 resp = self._client.request(method, path, json=body)
                 if resp.status_code >= 400:
@@ -69,23 +76,23 @@ class QumuloClient:
                         error_class=data.get("error_class", ""),
                         description=data.get("description", f"HTTP {resp.status_code}"),
                     )
-                    if resp.status_code >= 500 and attempt < MAX_RETRIES:
-                        last_err = err
-                        time.sleep(RETRY_BASE_DELAY * (2**attempt))
+                    if resp.status_code >= 500 and http_attempt < MAX_RETRIES:
+                        time.sleep(RETRY_BASE_DELAY * (2**http_attempt))
+                        http_attempt += 1
                         continue
                     raise err
                 return resp.json()
             except ApiError:
                 raise
             except httpx.TimeoutException as e:
-                raise ApiTimeout(str(e)) from e
+                raise ApiTimeout(f"The cluster did not respond in time ({e}).") from e
             except (httpx.NetworkError, httpx.TransportError) as e:
-                last_err = e
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_BASE_DELAY * (2**attempt))
+                if network_attempt < NETWORK_MAX_RETRIES:
+                    delay = min(RETRY_BASE_DELAY * (2**network_attempt), NETWORK_RETRY_MAX_DELAY)
+                    time.sleep(delay)
+                    network_attempt += 1
                     continue
-                raise
-        raise last_err  # type: ignore[misc]
+                raise ConnectionError(describe_connection_error(e)) from e
 
     def close(self) -> None:
         self._client.close()
@@ -95,6 +102,14 @@ class QumuloClient:
 
     def __exit__(self, *_):
         self.close()
+
+
+def describe_connection_error(e: Exception) -> str:
+    """Translate a raw network exception (often a bare OS errno string, e.g.
+    "[Errno -3] Temporary failure in name resolution") into something a user
+    can act on -- this always means the retry budget above was exhausted, so
+    it's a longer-than-transient network/DNS problem, not a one-off blip."""
+    return f"Lost connection to the cluster ({e}). This is usually a temporary network or DNS issue -- try again in a moment."
 
 
 def login(
