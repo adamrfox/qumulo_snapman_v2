@@ -83,6 +83,7 @@ export default function InspectDetail() {
   const [rows, setRows] = useState<ReclaimRow[]>([])
   const [points, setPoints] = useState<CurvePoint[]>([])
   const [unmeasured, setUnmeasured] = useState(0)
+  const [curveLastRun, setCurveLastRun] = useState<LastRun | null>(null)
   const [running, setRunning] = useState(false)
   const [activePairs, setActivePairs] = useState<Record<number, ActivePairItem>>({})
   const [completedPairs, setCompletedPairs] = useState(0)
@@ -154,7 +155,7 @@ export default function InspectDetail() {
   useEffect(() => {
     if (!clusterId || !sourceFileId) return
     api.inspect.curve(clusterId, sourceFileId)
-      .then(r => { setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs) })
+      .then(r => { setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs); setCurveLastRun(r.last_run) })
       .catch(e => {
         if (e instanceof ClusterAuthError) setClusterAuthExpired(true)
         if (e instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(e.message)
@@ -235,7 +236,7 @@ export default function InspectDetail() {
             setRunSummary(skipped || errored ? { skipped, errored } : null)
             api.inspect.curve(clusterId!, sourceFileId!)
               .then(r => {
-                setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs); setStatusMsg('')
+                setRows(r.rows); setPoints(r.points); setUnmeasured(r.unmeasured_pairs); setCurveLastRun(r.last_run); setStatusMsg('')
                 if (chainToSizeRef.current) {
                   chainToSizeRef.current = false
                   startSizeSnapshots()
@@ -296,6 +297,7 @@ export default function InspectDetail() {
             setRows(r.rows)
             setPoints(r.points)
             setUnmeasured(r.unmeasured_pairs)
+            setCurveLastRun(r.last_run)
             setStatusMsg('Stopped. Progress so far is saved — click Inspect again to resume.')
           })
           .catch(() => {})
@@ -864,6 +866,19 @@ export default function InspectDetail() {
           {unmeasured > 0 && (
             <p className="px-4 py-2 text-xs text-lychee-500">
               {unmeasured} pair{unmeasured > 1 ? 's' : ''} not yet measured — run Inspect to get a full curve
+            </p>
+          )}
+          {curveLastRun?.status === 'completed' && (
+            <p className="px-4 py-2 text-xs text-lychee-500">
+              Last Inspect run succeeded{curveLastRun.finished_at ? ` (${new Date(curveLastRun.finished_at).toLocaleString()})` : ''}
+              {' '}— this includes background "keep warm" runs as well as manual ones.
+            </p>
+          )}
+          {(curveLastRun?.status === 'error' || curveLastRun?.status === 'cancelled') && (
+            <p className="px-4 py-2 text-xs text-pomegranate-400">
+              Last Inspect run {curveLastRun.status}{curveLastRun.finished_at ? ` (${new Date(curveLastRun.finished_at).toLocaleString()})` : ''}
+              {curveLastRun.error_message ? `: ${curveLastRun.error_message}` : ''}
+              {' '}— this can happen from a background "keep warm" run as well as a manual one.
             </p>
           )}
         </div>

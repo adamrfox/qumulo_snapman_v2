@@ -17,7 +17,7 @@ from app import jobs as job_registry
 from app.auth import CurrentUser, RequireOperator
 from app.config import settings
 from app.database import SessionLocal, get_db
-from app.models import Cluster, InspectJob
+from app.models import Cluster, InspectJob, WarmTree
 from app.qumulo.api import UnsupportedVersionError
 from app.qumulo.client import ApiError
 from app.routers.clusters import decrypt_token, get_authorized_cluster
@@ -46,7 +46,7 @@ UNSUPPORTED_VERSION_STATUS = 426
 # ---------------------------------------------------------------------------
 
 
-def _make_qclient(cluster: Cluster):
+def make_qclient(cluster: Cluster):
     from app.qumulo.client import QumuloClient
 
     token = decrypt_token(cluster.token_encrypted)
@@ -59,7 +59,7 @@ def _open_cache():
     return Cache(Path(settings.cache_path))
 
 
-def _checked_cluster_name(qclient) -> str:
+def checked_cluster_name(qclient) -> str:
     """api.get_cluster_name, but gated on the cluster meeting MIN_CORE_VERSION
     first -- this is the first real API call every worker makes, so it's the
     natural place to fail fast with a clear reason instead of hitting a raw
@@ -105,10 +105,10 @@ async def refresh_snapshots(
     def _worker():
         from app.qumulo import api
 
-        qclient = _make_qclient(cluster)
+        qclient = make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             snaps = api.list_snapshots(qclient)
             cache.put_listing(cluster_name, [asdict(s) for s in snaps])
             return cluster_name, len(snaps)
@@ -142,10 +142,10 @@ async def get_groups(
             prune_prefix,
         )
 
-        qclient = _make_qclient(cluster)
+        qclient = make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -194,6 +194,62 @@ async def get_groups(
 
 
 # ---------------------------------------------------------------------------
+# GET/PUT/DELETE /{cluster_id}/warm-trees[/{source_file_id}] -- opt a tree in
+# or out of the background warm-inspect sweep (see app/warm_sweep.py)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{cluster_id}/warm-trees")
+async def list_warm_trees(
+    cluster_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    await get_authorized_cluster(cluster_id, user, db)
+    result = await db.execute(select(WarmTree).where(WarmTree.cluster_id == cluster_id))
+    return {"source_file_ids": [w.source_file_id for w in result.scalars().all()]}
+
+
+@router.put("/{cluster_id}/warm-trees/{source_file_id}")
+async def add_warm_tree(
+    cluster_id: str,
+    source_file_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    await get_authorized_cluster(cluster_id, user, db)
+    existing = await db.execute(
+        select(WarmTree).where(
+            WarmTree.cluster_id == cluster_id, WarmTree.source_file_id == source_file_id
+        )
+    )
+    if existing.scalar_one_or_none() is None:
+        db.add(WarmTree(cluster_id=cluster_id, source_file_id=source_file_id, created_by=user.id))
+        await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/{cluster_id}/warm-trees/{source_file_id}")
+async def remove_warm_tree(
+    cluster_id: str,
+    source_file_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    await get_authorized_cluster(cluster_id, user, db)
+    existing = await db.execute(
+        select(WarmTree).where(
+            WarmTree.cluster_id == cluster_id, WarmTree.source_file_id == source_file_id
+        )
+    )
+    row = existing.scalar_one_or_none()
+    if row is not None:
+        await db.delete(row)
+        await db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # GET /{cluster_id}/groups/{source_file_id}/curve  (cached curve, no new work)
 # ---------------------------------------------------------------------------
 
@@ -212,10 +268,10 @@ async def get_curve(
         from app.qumulo.compute.curve import build_points, reclaim_rows
         from app.qumulo.compute.groups import group_snapshots
 
-        qclient = _make_qclient(cluster)
+        qclient = make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -258,9 +314,31 @@ async def get_curve(
         finally:
             cache.close()
 
+    last_job_result = await db.execute(
+        select(InspectJob)
+        .where(
+            InspectJob.cluster_id == cluster_id,
+            InspectJob.source_file_id == source_file_id,
+            InspectJob.job_type == "inspect",
+        )
+        .order_by(InspectJob.started_at.desc())
+        .limit(1)
+    )
+    last_job = last_job_result.scalar_one_or_none()
+    last_run = (
+        {
+            "status": last_job.status,
+            "error_message": last_job.error_message,
+            "finished_at": last_job.finished_at.isoformat() if last_job.finished_at else None,
+        }
+        if last_job is not None
+        else None
+    )
+
     result = await _run_qumulo_worker(_worker)
     if result is None:
         raise HTTPException(404, "Source not found in snapshot listing")
+    result["last_run"] = last_run
     return result
 
 
@@ -282,10 +360,10 @@ async def get_snapshot_sizes(
         from app.qumulo import api
         from app.qumulo.compute.groups import age_days, group_snapshots
 
-        qclient = _make_qclient(cluster)
+        qclient = make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -399,10 +477,10 @@ async def older_than(
         from app.qumulo import api
         from app.qumulo.compute.groups import group_snapshots
 
-        qclient = _make_qclient(cluster)
+        qclient = make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             snaps_raw = cached or [asdict(s) for s in api.list_snapshots(qclient)]
             if cached is None:
@@ -455,8 +533,8 @@ async def start_inspect(
     def _get_cluster_name():
         from app.qumulo import api
 
-        qclient = _make_qclient(cluster)
-        return _checked_cluster_name(qclient)
+        qclient = make_qclient(cluster)
+        return checked_cluster_name(qclient)
 
     cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
@@ -521,6 +599,87 @@ async def launch_inspect_job(
     return job
 
 
+def load_tree_status(cluster_snapshot: dict, cluster_name: str, source_file_id: str) -> dict | None:
+    """Cache-only aside from a possible listing refresh / one-time path
+    lookup (same cost profile as GET /groups): this tree's path, its current
+    points + unmeasured-pair count, and a cheap prunable count used only to
+    decide run order. Shared by the goal orchestrator and the warm-tree
+    background sweep -- both need the exact same "is this tree already fully
+    measured, and if not why" check."""
+    from app.qumulo import api, paths
+    from app.qumulo.client import QumuloClient
+    from app.qumulo.compute.curve import build_points
+    from app.qumulo.compute.groups import group_snapshots, prune_prefix
+
+    token = decrypt_token(cluster_snapshot["token_encrypted"])
+    qclient = QumuloClient(
+        cluster_snapshot["host"],
+        cluster_snapshot["port"],
+        token,
+        insecure=cluster_snapshot["insecure"],
+    )
+    cache = _open_cache()
+    try:
+        cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
+        if cached is None:
+            snaps = api.list_snapshots(qclient)
+            cache.put_listing(cluster_name, [asdict(s) for s in snaps])
+        else:
+            snaps = [api.Snapshot.from_json(d) for d in cached]
+        now = datetime.now(timezone.utc)
+        group = next(
+            (g for g in group_snapshots(snaps, now) if g.source_file_id == source_file_id), None
+        )
+        if group is None:
+            return None
+        path = paths.resolve_source_path(
+            qclient, cache, cluster_name, source_file_id, group.snapshots[-1].id
+        )
+        pairs = cache.get_pairs(cluster_name, source_file_id)
+        snaps_sorted = sorted(group.snapshots, key=lambda s: s.id)
+        points, unmeasured = build_points(snaps_sorted, pairs, now)
+        prunable = prune_prefix(group, now, 0).prunable
+
+        # If an unmeasured pair's older snapshot is locked/replication-held,
+        # that's *why* -- Inspect skips held snapshots by default (their
+        # size isn't actionable since they can't be deleted anyway), and
+        # that skip is never cached, so this tree can never reach 0
+        # unmeasured through an ordinary auto-inspect no matter how many
+        # times it's retried. Surface that instead of a generic "still
+        # incomplete" message so it's clear this isn't transient.
+        held_reason = None
+        if unmeasured > 0:
+            snaps_by_id = {s.id: s for s in group.snapshots}
+            for p in points:
+                if p["status"] in ("pending", "timed_out"):
+                    snap = snaps_by_id.get(p["older_id"])
+                    if snap is not None and snap.held:
+                        held_reason = snap.held_reason
+                        break
+
+        return {
+            "path": path,
+            "points": points,
+            "unmeasured": unmeasured,
+            "prunable": prunable,
+            "held_reason": held_reason,
+        }
+    finally:
+        cache.close()
+
+
+def is_cluster_wide_fatal(e: Exception) -> bool:
+    # These mean every remaining tree would fail the exact same way, so
+    # there's no point treating them as one tree's problem -- an expired
+    # token or an unsupported Core version aborts the whole run, same as
+    # a single-tree Inspect would already report it.
+    if isinstance(e, UnsupportedVersionError):
+        return True
+    if isinstance(e, ApiError) and e.status_code in (401, 403):
+        return True
+    return False
+
+
 async def _run_inspect_task(
     job: job_registry.InspectJob,
     cluster_snapshot: dict,
@@ -550,7 +709,7 @@ async def _run_inspect_task(
         )
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -634,8 +793,8 @@ async def start_goal(
         raise HTTPException(400, "source_file_ids must not be empty")
 
     def _get_cluster_name():
-        qclient = _make_qclient(cluster)
-        return _checked_cluster_name(qclient)
+        qclient = make_qclient(cluster)
+        return checked_cluster_name(qclient)
 
     cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
@@ -692,83 +851,6 @@ async def _run_goal_task(
     def push(event_type: str, data: dict) -> None:
         loop.call_soon_threadsafe(job.event_queue.put_nowait, {"type": event_type, **data})
 
-    def _load_tree(sfid: str) -> dict | None:
-        """Cache-only aside from a possible listing refresh / one-time path
-        lookup (same cost profile as GET /groups): this tree's path, its
-        current points + unmeasured-pair count, and a cheap prunable count
-        used only to decide run order."""
-        from app.qumulo import api, paths
-        from app.qumulo.client import QumuloClient
-        from app.qumulo.compute.curve import build_points
-        from app.qumulo.compute.groups import group_snapshots, prune_prefix
-
-        token = decrypt_token(cluster_snapshot["token_encrypted"])
-        qclient = QumuloClient(
-            cluster_snapshot["host"],
-            cluster_snapshot["port"],
-            token,
-            insecure=cluster_snapshot["insecure"],
-        )
-        cache = _open_cache()
-        try:
-            cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
-            if cached is None:
-                snaps = api.list_snapshots(qclient)
-                cache.put_listing(cluster_name, [asdict(s) for s in snaps])
-            else:
-                snaps = [api.Snapshot.from_json(d) for d in cached]
-            now = datetime.now(timezone.utc)
-            group = next(
-                (g for g in group_snapshots(snaps, now) if g.source_file_id == sfid), None
-            )
-            if group is None:
-                return None
-            path = paths.resolve_source_path(
-                qclient, cache, cluster_name, sfid, group.snapshots[-1].id
-            )
-            pairs = cache.get_pairs(cluster_name, sfid)
-            snaps_sorted = sorted(group.snapshots, key=lambda s: s.id)
-            points, unmeasured = build_points(snaps_sorted, pairs, now)
-            prunable = prune_prefix(group, now, 0).prunable
-
-            # If an unmeasured pair's older snapshot is locked/replication-held,
-            # that's *why* -- Inspect skips held snapshots by default (their
-            # size isn't actionable since they can't be deleted anyway), and
-            # that skip is never cached, so this tree can never reach 0
-            # unmeasured through an ordinary auto-inspect no matter how many
-            # times it's retried. Surface that instead of a generic "still
-            # incomplete" message so it's clear this isn't transient.
-            held_reason = None
-            if unmeasured > 0:
-                snaps_by_id = {s.id: s for s in group.snapshots}
-                for p in points:
-                    if p["status"] in ("pending", "timed_out"):
-                        snap = snaps_by_id.get(p["older_id"])
-                        if snap is not None and snap.held:
-                            held_reason = snap.held_reason
-                            break
-
-            return {
-                "path": path,
-                "points": points,
-                "unmeasured": unmeasured,
-                "prunable": prunable,
-                "held_reason": held_reason,
-            }
-        finally:
-            cache.close()
-
-    def _is_cluster_wide_fatal(e: Exception) -> bool:
-        # These mean every remaining tree would fail the exact same way, so
-        # there's no point treating them as one tree's problem -- an expired
-        # token or an unsupported Core version aborts the whole run, same as
-        # a single-tree Inspect would already report it.
-        if isinstance(e, UnsupportedVersionError):
-            return True
-        if isinstance(e, ApiError) and e.status_code in (401, 403):
-            return True
-        return False
-
     skipped: list[dict] = []
 
     try:
@@ -778,9 +860,9 @@ async def _run_goal_task(
         loaded: dict[str, dict] = {}
         for sfid in source_file_ids:
             try:
-                info = await loop.run_in_executor(None, _load_tree, sfid)
+                info = await loop.run_in_executor(None, load_tree_status, cluster_snapshot, cluster_name, sfid)
             except Exception as e:
-                if _is_cluster_wide_fatal(e):
+                if is_cluster_wide_fatal(e):
                     raise
                 reason = str(e)
                 push("tree_skipped", {"source_file_id": sfid, "reason": reason})
@@ -857,9 +939,9 @@ async def _run_goal_task(
                             if sub_job.done and sub_job.event_queue.empty():
                                 break
 
-                    info = await loop.run_in_executor(None, _load_tree, sfid)
+                    info = await loop.run_in_executor(None, load_tree_status, cluster_snapshot, cluster_name, sfid)
             except Exception as e:
-                if _is_cluster_wide_fatal(e):
+                if is_cluster_wide_fatal(e):
                     raise
                 reason = str(e)
                 push("tree_skipped", {"source_file_id": sfid, "reason": reason})
@@ -927,8 +1009,8 @@ async def start_size_snapshots(
     def _get_cluster_name():
         from app.qumulo import api
 
-        qclient = _make_qclient(cluster)
-        return _checked_cluster_name(qclient)
+        qclient = make_qclient(cluster)
+        return checked_cluster_name(qclient)
 
     cluster_name = await _run_qumulo_worker(_get_cluster_name)
 
@@ -997,7 +1079,7 @@ async def _run_size_snapshots_task(
         )
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -1088,10 +1170,10 @@ async def start_estimate_deletion(
         )
         from app.qumulo.compute.groups import group_snapshots
 
-        qclient = _make_qclient(cluster)
+        qclient = make_qclient(cluster)
         cache = _open_cache()
         try:
-            cluster_name = _checked_cluster_name(qclient)
+            cluster_name = checked_cluster_name(qclient)
             cached = cache.get_listing(cluster_name, ttl_seconds=settings.snapshot_listing_ttl)
             if cached is None:
                 snaps = api.list_snapshots(qclient)
@@ -1331,7 +1413,7 @@ async def delete_snapshots(
     def _worker():
         from app.qumulo import api
 
-        qclient = _make_qclient(cluster)
+        qclient = make_qclient(cluster)
         deleted = []
         errors = []
         for snap_id in req.snapshot_ids:
@@ -1348,7 +1430,7 @@ async def delete_snapshots(
             # for every subsequent Inspect/Size-snapshots/Estimate call.
             cache = _open_cache()
             try:
-                cluster_name = _checked_cluster_name(qclient)
+                cluster_name = checked_cluster_name(qclient)
                 snaps = api.list_snapshots(qclient)
                 cache.put_listing(cluster_name, [asdict(s) for s in snaps])
             finally:

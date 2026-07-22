@@ -91,7 +91,7 @@ export const api = {
         'GET', `/api/clusters/${clusterId}/groups?older_than_days=${olderThanDays}`
       ),
     curve: (clusterId: string, sourceFileId: string) =>
-      request<{ rows: import('./types').ReclaimRow[]; points: import('./types').CurvePoint[]; unmeasured_pairs: number }>(
+      request<{ rows: import('./types').ReclaimRow[]; points: import('./types').CurvePoint[]; unmeasured_pairs: number; last_run: import('./types').LastRun | null }>(
         'GET', `/api/clusters/${clusterId}/groups/${sourceFileId}/curve`
       ),
     snapshotSizes: (clusterId: string, sourceFileId: string) =>
@@ -124,5 +124,11 @@ export const api = {
       request<{ job_id: string }>(
         'POST', `/api/clusters/${clusterId}/goal`, { source_file_ids: sourceFileIds, target_bytes: targetBytes }
       ),
+    warmTrees: (clusterId: string) =>
+      request<{ source_file_ids: string[] }>('GET', `/api/clusters/${clusterId}/warm-trees`),
+    addWarmTree: (clusterId: string, sourceFileId: string) =>
+      request<{ ok: boolean }>('PUT', `/api/clusters/${clusterId}/warm-trees/${sourceFileId}`),
+    removeWarmTree: (clusterId: string, sourceFileId: string) =>
+      request<{ ok: boolean }>('DELETE', `/api/clusters/${clusterId}/warm-trees/${sourceFileId}`),
   },
 }

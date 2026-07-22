@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app import warm_sweep
 from app.bootstrap import ensure_admin
 from app.database import SessionLocal
 from app.routers import admin_logs, auth, clusters, inspect, users
@@ -11,7 +12,9 @@ from app.routers import admin_logs, auth, clusters, inspect, users
 async def lifespan(app: FastAPI):
     async with SessionLocal() as db:
         await ensure_admin(db)
+    await warm_sweep.start()
     yield
+    await warm_sweep.stop()
 
 
 app = FastAPI(title="snapman", lifespan=lifespan)

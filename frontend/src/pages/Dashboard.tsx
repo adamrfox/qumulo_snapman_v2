@@ -28,6 +28,7 @@ export default function Dashboard() {
   const [olderThanDays, setOlderThanDays] = useState(90)
   const [olderThanInput, setOlderThanInput] = useState('90')
   const [selectedTrees, setSelectedTrees] = useState<Set<string>>(new Set())
+  const [warmTrees, setWarmTrees] = useState<Set<string>>(new Set())
   const [showGoalModal, setShowGoalModal] = useState(false)
   const [reopenGoal, setReopenGoal] = useState<GoalReturnState | null>(null)
 
@@ -83,6 +84,11 @@ export default function Dashboard() {
 
   useEffect(() => {
     setSelectedTrees(new Set())
+    setWarmTrees(new Set())
+    if (!selectedId) return
+    api.inspect.warmTrees(selectedId)
+      .then(r => setWarmTrees(new Set(r.source_file_ids)))
+      .catch(() => {})
   }, [selectedId])
 
   function toggleTree(sourceFileId: string) {
@@ -92,6 +98,23 @@ export default function Dashboard() {
       else next.add(sourceFileId)
       return next
     })
+  }
+
+  async function toggleWarmTree(sourceFileId: string) {
+    if (!selectedId) return
+    const isWarm = warmTrees.has(sourceFileId)
+    try {
+      if (isWarm) await api.inspect.removeWarmTree(selectedId, sourceFileId)
+      else await api.inspect.addWarmTree(selectedId, sourceFileId)
+      setWarmTrees(prev => {
+        const next = new Set(prev)
+        if (isWarm) next.delete(sourceFileId)
+        else next.add(sourceFileId)
+        return next
+      })
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to update background inspect setting')
+    }
   }
 
   function toggleSelectAllTrees() {
@@ -352,6 +375,7 @@ export default function Dashboard() {
                       <th className="px-4 py-3 text-right">Prunable</th>
                       <th className="px-4 py-3 text-right">Measured</th>
                       <th className="px-4 py-3 text-right">Reclaim~</th>
+                      <th className="px-4 py-3 text-center" title="Automatically keep this tree's reclaim curve refreshed in the background, even when nobody has the app open">Keep warm</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-blackberry-700">
@@ -389,6 +413,14 @@ export default function Dashboard() {
                               : g.measured_pairs === 0
                               ? <span className="text-lychee-500">not measured</span>
                               : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-center" onClick={e => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={warmTrees.has(g.source_file_id)}
+                              onChange={() => toggleWarmTree(g.source_file_id)}
+                              title="Automatically keep this tree's reclaim curve refreshed in the background, even when nobody has the app open"
+                            />
                           </td>
                         </tr>
                       ))}

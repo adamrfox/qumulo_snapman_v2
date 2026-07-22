@@ -28,6 +28,15 @@ class Settings:
     pair_batch_size: int = int(os.environ.get("PAIR_BATCH_SIZE", "50"))
     api_timeout: float = float(os.environ.get("API_TIMEOUT", "300.0"))
 
+    # Warm-tree background sweep (see app/warm_sweep.py): how often an
+    # already-running per-cluster sweep loop re-checks its opted-in trees,
+    # and how often the supervisor checks for clusters that gained/lost
+    # their last opted-in tree.
+    warm_sweep_interval_seconds: float = float(os.environ.get("WARM_SWEEP_INTERVAL_SECONDS", "900"))
+    warm_sweep_poll_interval_seconds: float = float(
+        os.environ.get("WARM_SWEEP_POLL_INTERVAL_SECONDS", "60")
+    )
+
     @property
     def fernet(self):
         from cryptography.fernet import Fernet

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -40,6 +40,9 @@ class Cluster(Base):
     jobs: Mapped[list["InspectJob"]] = relationship(
         "InspectJob", back_populates="cluster", cascade="all, delete-orphan"
     )
+    warm_trees: Mapped[list["WarmTree"]] = relationship(
+        "WarmTree", back_populates="cluster", cascade="all, delete-orphan"
+    )
 
 
 class InspectJob(Base):
@@ -62,3 +65,23 @@ class InspectJob(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     cluster: Mapped["Cluster"] = relationship("Cluster", back_populates="jobs")
+
+
+class WarmTree(Base):
+    __tablename__ = "warm_trees"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    cluster_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clusters.id"), nullable=False
+    )
+    source_file_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    cluster: Mapped["Cluster"] = relationship("Cluster", back_populates="warm_trees")
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "source_file_id", name="uq_warm_trees_cluster_tree"),
+    )
