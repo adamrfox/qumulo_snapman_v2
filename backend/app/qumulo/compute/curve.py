@@ -33,7 +33,7 @@ def _point(
     }
 
 
-ReclaimRow = tuple[int, str, int, int]
+ReclaimRow = tuple[int, str, int, int, int]
 
 
 def reclaim_rows(
@@ -55,7 +55,7 @@ def reclaim_rows(
         if not buf:
             return
         p = sized[buf[-1]]
-        rows.append((p["newer_age_days"], p["newer_date"], buf[-1] + 1, p["cumulative_bytes"]))
+        rows.append((p["newer_age_days"], p["newer_date"], buf[-1] + 1, p["cumulative_bytes"], p["newer_id"]))
 
     for j, p in enumerate(sized):
         freed = p["freed_bytes"] or 0

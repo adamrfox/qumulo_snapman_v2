@@ -34,6 +34,7 @@ export interface SnapshotGroup {
 export interface ReclaimRow {
   keep_days: number
   delete_before: string
+  delete_before_id: number
   delete_count: number
   reclaim_bytes: number
 }
@@ -74,6 +75,7 @@ export interface TreeAllocation {
   delete_snapshot_ids: number[]
   keep_days: number | null
   delete_before: string | null
+  delete_before_id: number | null
   delete_count: number
   reclaim_bytes: number
   days_sacrificed: number

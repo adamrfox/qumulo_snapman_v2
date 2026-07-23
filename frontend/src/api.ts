@@ -112,9 +112,9 @@ export const api = {
       ),
     cancelInspect: (clusterId: string, jobId: string) =>
       request<{ ok: boolean }>('POST', `/api/clusters/${clusterId}/jobs/${jobId}/cancel`),
-    olderThan: (clusterId: string, sourceFileId: string, before: string) =>
+    olderThan: (clusterId: string, sourceFileId: string, beforeId: number) =>
       request<{ snapshot_ids: number[]; count: number }>(
-        'GET', `/api/clusters/${clusterId}/older-than?source_file_id=${sourceFileId}&before=${before}`
+        'GET', `/api/clusters/${clusterId}/older-than?source_file_id=${sourceFileId}&before_id=${beforeId}`
       ),
     deleteSnapshots: (clusterId: string, snapshotIds: number[]) =>
       request<{ deleted: number[]; errors: { id: number; error: string }[] }>(

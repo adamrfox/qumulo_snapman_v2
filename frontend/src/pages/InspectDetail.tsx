@@ -312,7 +312,7 @@ export default function InspectDetail() {
     if (deleteTargetIds === null && clusterId && sourceFileId && deleteTarget) {
       setLoadingDeleteTargetList(true)
       try {
-        const { snapshot_ids } = await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before)
+        const { snapshot_ids } = await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before_id)
         setDeleteTargetIds(snapshot_ids)
       } finally {
         setLoadingDeleteTargetList(false)
@@ -350,7 +350,7 @@ export default function InspectDetail() {
     // Reuse the ids already fetched for the optional list, if the user looked at
     // it, so what gets deleted is exactly what they saw rather than a second,
     // possibly-slightly-different snapshot of "older than" at delete time.
-    const ids = deleteTargetIds ?? (await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before)).snapshot_ids
+    const ids = deleteTargetIds ?? (await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before_id)).snapshot_ids
     const result = await api.inspect.deleteSnapshots(clusterId, ids)
     setDeleteResult(result)
     setDeleteTarget(null)

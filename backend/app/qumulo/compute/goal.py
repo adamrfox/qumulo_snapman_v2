@@ -25,6 +25,7 @@ class TreeAllocation:
     delete_snapshot_ids: list[int] = field(default_factory=list)
     keep_days: int | None = None
     delete_before: str | None = None
+    delete_before_id: int | None = None
     delete_count: int = 0
     reclaim_bytes: int = 0
     days_sacrificed: int = 0
@@ -103,6 +104,7 @@ def allocate(target_bytes: int, trees: list[TreeInput]) -> GoalResult:
         alloc.delete_snapshot_ids = [p["older_id"] for p in tree.points[: cursor + 1]]
         alloc.keep_days = tree.points[cursor]["newer_age_days"]
         alloc.delete_before = tree.points[cursor]["newer_date"]
+        alloc.delete_before_id = tree.points[cursor]["newer_id"]
         alloc.delete_count = cursor + 1
         alloc.reclaim_bytes = tree.points[cursor]["cumulative_bytes"]
         alloc.days_sacrificed = tree.points[0]["older_age_days"] - alloc.keep_days
@@ -138,6 +140,7 @@ def allocate(target_bytes: int, trees: list[TreeInput]) -> GoalResult:
             alloc.delete_snapshot_ids = []
             alloc.keep_days = None
             alloc.delete_before = None
+            alloc.delete_before_id = None
             alloc.delete_count = 0
             alloc.reclaim_bytes = 0
             alloc.days_sacrificed = 0
@@ -148,6 +151,7 @@ def allocate(target_bytes: int, trees: list[TreeInput]) -> GoalResult:
             alloc.delete_snapshot_ids = [pp["older_id"] for pp in tree.points[: prev_cursor + 1]]
             alloc.keep_days = p["newer_age_days"]
             alloc.delete_before = p["newer_date"]
+            alloc.delete_before_id = p["newer_id"]
             alloc.delete_count = prev_cursor + 1
             alloc.reclaim_bytes = p["cumulative_bytes"]
             alloc.days_sacrificed = tree.points[0]["older_age_days"] - alloc.keep_days

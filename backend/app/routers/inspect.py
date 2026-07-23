@@ -306,6 +306,7 @@ async def get_curve(
                         "delete_before": r[1],
                         "delete_count": r[2],
                         "reclaim_bytes": r[3],
+                        "delete_before_id": r[4],
                     }
                     for r in rows
                 ],
@@ -467,7 +468,7 @@ async def get_snapshot_sizes(
 async def older_than(
     cluster_id: str,
     source_file_id: str,
-    before: str,
+    before_id: int,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
@@ -493,11 +494,11 @@ async def older_than(
             if group is None:
                 return []
 
-            ids = []
-            for snap in sorted(group.snapshots, key=lambda s: s.id):
-                snap_date = snap.timestamp[:10]
-                if snap_date < before:
-                    ids.append(snap.id)
+            # Compare by id, not calendar date -- a date-string cutoff silently
+            # drops any snapshot that shares its calendar day with the kept
+            # boundary snapshot, since id order (not the date, which can repeat
+            # within a day) is what delete_count/delete_before were computed from.
+            ids = [snap.id for snap in group.snapshots if snap.id < before_id]
             return ids
         finally:
             cache.close()

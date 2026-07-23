@@ -241,6 +241,7 @@ export default function GoalModal({
         recommendedTarget: {
           keep_days: alloc.keep_days,
           delete_before: alloc.delete_before,
+          delete_before_id: alloc.delete_before_id,
           delete_count: alloc.delete_count,
           reclaim_bytes: alloc.reclaim_bytes,
         },
@@ -254,7 +255,7 @@ export default function GoalModal({
 
   return (
     <div className="fixed inset-0 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-2xl rounded-lg border border-blackberry-700 bg-blackberry-900 p-6 shadow-xl">
+      <div className="w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-lg border border-blackberry-700 bg-blackberry-900 p-6 shadow-xl">
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-base font-semibold text-lychee-100">Solve for a space goal</h3>
           <button onClick={onClose} className="text-sm text-lychee-400 hover:text-lychee-100">✕</button>
@@ -350,7 +351,7 @@ export default function GoalModal({
             <p className="mb-2 text-sm text-lychee-300">{statusMsg}</p>
             {currentTree && (
               <div className="mb-4 rounded-md border border-blackberry-700 bg-blackberry-925 p-3 text-xs">
-                <p className="font-mono text-lychee-300">{currentTree.path}</p>
+                <p className="overflow-x-auto whitespace-nowrap font-mono text-lychee-300">{currentTree.path}</p>
                 <p className="mt-1 text-lychee-500">Tree {currentTree.index + 1} of {currentTree.total}</p>
                 {pairProgress && (
                   <p className="mt-1 text-lychee-500">Pair {pairProgress.current} of {pairProgress.total}</p>
