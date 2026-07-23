@@ -96,6 +96,7 @@ export default function InspectDetail() {
   const [deleteTargetIds, setDeleteTargetIds] = useState<number[] | null>(null)
   const [showDeleteTargetList, setShowDeleteTargetList] = useState(false)
   const [loadingDeleteTargetList, setLoadingDeleteTargetList] = useState(false)
+  const [deleteTargetListError, setDeleteTargetListError] = useState<string | null>(null)
 
   // Arriving here from the goal solver's "Review & delete" pre-fills and
   // opens this exact confirmation modal instead of the results screen
@@ -108,6 +109,7 @@ export default function InspectDetail() {
       setDeleteConfirm('')
       setDeleteTargetIds(null)
       setShowDeleteTargetList(false)
+      setDeleteTargetListError(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -311,9 +313,15 @@ export default function InspectDetail() {
     }
     if (deleteTargetIds === null && clusterId && sourceFileId && deleteTarget) {
       setLoadingDeleteTargetList(true)
+      setDeleteTargetListError(null)
       try {
+        if (deleteTarget.delete_before_id === null) {
+          throw new Error('This plan has no snapshot cutoff id to look up (try re-solving).')
+        }
         const { snapshot_ids } = await api.inspect.olderThan(clusterId, sourceFileId, deleteTarget.delete_before_id)
         setDeleteTargetIds(snapshot_ids)
+      } catch (e) {
+        setDeleteTargetListError(e instanceof Error ? e.message : 'Failed to load the snapshot list.')
       } finally {
         setLoadingDeleteTargetList(false)
       }
@@ -347,6 +355,11 @@ export default function InspectDetail() {
 
   async function doDelete() {
     if (!clusterId || !deleteTarget || !sourceFileId) return
+    if (deleteTarget.delete_before_id === null) {
+      setDeleteTargetListError('This plan has no snapshot cutoff id to look up (try re-solving).')
+      setShowDeleteTargetList(true)
+      return
+    }
     // Reuse the ids already fetched for the optional list, if the user looked at
     // it, so what gets deleted is exactly what they saw rather than a second,
     // possibly-slightly-different snapshot of "older than" at delete time.
@@ -852,7 +865,7 @@ export default function InspectDetail() {
                   {canDelete && (
                     <td className="px-4 py-3 text-right">
                       <button
-                        onClick={() => { setDeleteTarget(row); setDeleteConfirm(''); setDeleteTargetIds(null); setShowDeleteTargetList(false) }}
+                        onClick={() => { setDeleteTarget(row); setDeleteConfirm(''); setDeleteTargetIds(null); setShowDeleteTargetList(false); setDeleteTargetListError(null) }}
                         className="rounded-md bg-pomegranate-600 px-3 py-1 text-xs text-lychee-50 hover:bg-pomegranate-700"
                       >
                         Delete
@@ -1160,6 +1173,8 @@ export default function InspectDetail() {
                 <div className="mt-2 max-h-48 overflow-y-auto rounded-md border border-blackberry-700 bg-blackberry-950 p-2 font-mono text-xs text-lychee-400">
                   {loadingDeleteTargetList
                     ? 'Loading…'
+                    : deleteTargetListError
+                    ? <span className="text-pomegranate-400">{deleteTargetListError}</span>
                     : (deleteTargetIds ?? []).map(id => {
                         const row = sizeRows.find(r => r.id === id)
                         return <div key={id}>{row ? `${row.date}  ${row.name}` : `#${id}`}</div>
