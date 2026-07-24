@@ -210,22 +210,26 @@ export default function GoalModal({
     return used.reduce((max, a) => (a.reclaim_bytes > max.reclaim_bytes ? a : max)).source_file_id
   }
 
+  // Whether excluding the plan's biggest contributor would leave anything to
+  // re-solve with at all -- known without asking the backend, since it's
+  // just set arithmetic over already-loaded data (unlike whether a *found*
+  // remaining combination actually reaches the goal, which genuinely can't
+  // be known without running the solver).
+  function nextCombinationTreeIds(): string[] {
+    const biggest = biggestContributor()
+    if (!biggest) return []
+    const nextExcluded = new Set(excludedIds)
+    nextExcluded.add(biggest)
+    return groups.filter(g => !nextExcluded.has(g.source_file_id)).map(g => g.source_file_id)
+  }
+
   function tryDifferentCombination() {
     const biggest = biggestContributor()
     if (!biggest) return
     const nextExcluded = new Set(excludedIds)
     nextExcluded.add(biggest)
-    const sourceFileIds = groups
-      .filter(g => !nextExcluded.has(g.source_file_id))
-      .map(g => g.source_file_id)
-    if (sourceFileIds.length === 0) {
-      // Nothing left to solve with once the only remaining contributor is
-      // excluded -- the backend rejects an empty source_file_ids list
-      // outright (400), so treat this the same as "no alternative found"
-      // instead of making a request that can only fail.
-      setNoMoreAlternatives(true)
-      return
-    }
+    const sourceFileIds = nextCombinationTreeIds()
+    if (sourceFileIds.length === 0) return // button is hidden in this case; defensive no-op
     runSolve(sourceFileIds, nextExcluded)
   }
 
@@ -476,7 +480,7 @@ export default function GoalModal({
             </div>
 
             <div className="flex justify-end gap-2">
-              {result.goal_met && !noMoreAlternatives && biggestContributor() && (
+              {result.goal_met && !noMoreAlternatives && nextCombinationTreeIds().length > 0 && (
                 <button
                   onClick={tryDifferentCombination}
                   title="Exclude this plan's biggest contributor and re-solve with what's left, to see if the goal is still reachable another way"
