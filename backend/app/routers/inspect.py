@@ -889,7 +889,14 @@ async def _run_goal_task(
             )
 
             try:
-                if info["unmeasured"] > 0:
+                # held_reason means an unmeasured pair's older snapshot is
+                # locked/replication-held -- Inspect skips held snapshots by
+                # default, so launching one here can never bring unmeasured
+                # to 0 no matter how many times it's retried. Same reasoning
+                # the warm sweep already uses to give up on these (see
+                # load_tree_status): don't burn a live scan we already know
+                # is doomed, just fall through to the "skipped" branch below.
+                if info["unmeasured"] > 0 and info["held_reason"] is None:
                     # Trees run strictly one at a time -- this is the one part of
                     # this feature that does new, potentially heavy live Qumulo
                     # work, and nothing else in this app runs more than one such
