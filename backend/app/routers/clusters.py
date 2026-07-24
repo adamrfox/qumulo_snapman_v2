@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, model_validator
@@ -9,7 +10,8 @@ from app.auth import CurrentUser
 from app.config import settings
 from app.database import get_db
 from app.models import Cluster, User, to_utc_iso
-from app.qumulo.client import ApiError, login as qumulo_login
+from app.qumulo.client import ApiError, create_access_token, login as qumulo_login, revoke_access_token, who_am_i
+from app.routers.admin_settings import get_settings as get_app_settings
 
 router = APIRouter()
 
@@ -43,6 +45,55 @@ async def get_authorized_cluster(
 
 def decrypt_token(encrypted: str) -> str:
     return settings.fernet.decrypt(encrypted.encode()).decode()
+
+
+async def _login_and_create_access_token(
+    host: str, port: int, username: str, password: str, insecure: bool, db: AsyncSession
+) -> tuple[str, str, datetime | None]:
+    """Log in with username/password, then immediately trade that session for
+    a Qumulo access token (see app/qumulo/client.py) with the admin-configured
+    lifetime -- never store the raw session token, since its lifetime is
+    fixed and outside this app's control. Returns (token_id, bearer_token,
+    expires_at)."""
+    loop = asyncio.get_event_loop()
+    session_token = await loop.run_in_executor(None, qumulo_login, host, port, username, password, insecure)
+    who = await loop.run_in_executor(None, who_am_i, host, port, session_token, insecure)
+
+    lifetime_days = (await get_app_settings(db)).access_token_lifetime_days
+    expiration: str | None = None
+    expires_at: datetime | None = None
+    if lifetime_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=lifetime_days)
+        expiration = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    token_id, bearer_token = await loop.run_in_executor(
+        None, create_access_token, host, port, session_token, {"sid": who["sid"]}, expiration, insecure
+    )
+    return token_id, bearer_token, expires_at
+
+
+async def _revoke_outgoing_token_at(
+    host: str, port: int, token_encrypted: str, token_id: str, insecure: bool
+) -> None:
+    """Best-effort: revoke an access token this app previously created,
+    against the host/port/credentials it actually belongs to. A stale
+    unrevoked token left behind on the customer's cluster is a minor
+    cleanliness issue, not worth failing the request over -- so any failure
+    here is swallowed."""
+    try:
+        current_token = decrypt_token(token_encrypted)
+        await asyncio.get_event_loop().run_in_executor(
+            None, revoke_access_token, host, port, current_token, token_id, insecure
+        )
+    except Exception:
+        pass
+
+
+async def _revoke_outgoing_token(cluster: Cluster) -> None:
+    if cluster.token_id:
+        await _revoke_outgoing_token_at(
+            cluster.host, cluster.port, cluster.token_encrypted, cluster.token_id, cluster.insecure
+        )
 
 
 class ClusterCreate(BaseModel):
@@ -91,12 +142,14 @@ async def list_clusters(user: CurrentUser, db: AsyncSession = Depends(get_db)):
 async def create_cluster(
     req: ClusterCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ):
+    token_id: str | None = None
+    token_expires_at: datetime | None = None
     if req.token:
         token = req.token
     else:
         try:
-            token = await asyncio.get_event_loop().run_in_executor(
-                None, qumulo_login, req.host, req.port, req.username, req.password, req.insecure
+            token_id, token, token_expires_at = await _login_and_create_access_token(
+                req.host, req.port, req.username, req.password, req.insecure, db
             )
         except ApiError as e:
             raise HTTPException(400, f"Qumulo login failed: {e}")
@@ -110,6 +163,8 @@ async def create_cluster(
         host=req.host,
         port=req.port,
         token_encrypted=encrypted,
+        token_id=token_id,
+        token_expires_at=token_expires_at,
         insecure=req.insecure,
     )
     db.add(cluster)
@@ -134,6 +189,12 @@ async def update_cluster(
     db: AsyncSession = Depends(get_db),
 ):
     cluster = await get_authorized_cluster(cluster_id, user, db)
+    # Snapshot the outgoing host/port/token before anything is mutated below
+    # -- a revoke has to target wherever the *old* token actually lives, not
+    # a host/port this same request may also be changing.
+    old_host, old_port = cluster.host, cluster.port
+    old_token_encrypted, old_token_id = cluster.token_encrypted, cluster.token_id
+
     if req.display_name is not None:
         cluster.display_name = req.display_name
     if req.host is not None:
@@ -144,23 +205,25 @@ async def update_cluster(
         cluster.insecure = req.insecure
 
     if req.token is not None:
+        if old_token_id:
+            await _revoke_outgoing_token_at(old_host, old_port, old_token_encrypted, old_token_id, cluster.insecure)
         cluster.token_encrypted = settings.fernet.encrypt(req.token.encode()).decode()
+        cluster.token_id = None
+        cluster.token_expires_at = None
     elif req.username and req.password:
         try:
-            token = await asyncio.get_event_loop().run_in_executor(
-                None,
-                qumulo_login,
-                cluster.host,
-                cluster.port,
-                req.username,
-                req.password,
-                cluster.insecure,
+            token_id, token, token_expires_at = await _login_and_create_access_token(
+                cluster.host, cluster.port, req.username, req.password, cluster.insecure, db
             )
         except ApiError as e:
             raise HTTPException(400, f"Qumulo login failed: {e}")
         except Exception as e:
             raise HTTPException(400, f"Could not reach cluster: {e}")
+        if old_token_id:
+            await _revoke_outgoing_token_at(old_host, old_port, old_token_encrypted, old_token_id, cluster.insecure)
         cluster.token_encrypted = settings.fernet.encrypt(token.encode()).decode()
+        cluster.token_id = token_id
+        cluster.token_expires_at = token_expires_at
 
     await db.commit()
     return _serialize(cluster)
@@ -171,6 +234,7 @@ async def delete_cluster(
     cluster_id: str, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ):
     cluster = await get_authorized_cluster(cluster_id, user, db)
+    await _revoke_outgoing_token(cluster)
     await db.delete(cluster)
     await db.commit()
     return {"ok": True}

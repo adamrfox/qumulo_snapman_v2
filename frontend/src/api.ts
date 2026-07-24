@@ -60,6 +60,12 @@ export const api = {
       request<{ backend_log: string; nginx_access_log: string; nginx_error_log: string }>(
         'GET', `/api/admin/logs?lines=${lines}`
       ),
+    getSettings: () =>
+      request<{ access_token_lifetime_days: number | null }>('GET', '/api/admin/settings'),
+    updateSettings: (accessTokenLifetimeDays: number | null) =>
+      request<{ access_token_lifetime_days: number | null }>(
+        'PATCH', '/api/admin/settings', { access_token_lifetime_days: accessTokenLifetimeDays }
+      ),
   },
   clusters: {
     list: () => request<import('./types').Cluster[]>('GET', '/api/clusters/'),

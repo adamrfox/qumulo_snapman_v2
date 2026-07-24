@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from app import warm_sweep
 from app.bootstrap import ensure_admin
 from app.database import SessionLocal
-from app.routers import admin_logs, auth, clusters, inspect, users
+from app.routers import admin_logs, admin_settings, auth, clusters, inspect, users
 
 
 @asynccontextmanager
@@ -24,3 +24,4 @@ app.include_router(users.router, prefix="/api/users", tags=["users"])
 app.include_router(clusters.router, prefix="/api/clusters", tags=["clusters"])
 app.include_router(inspect.router, prefix="/api/clusters", tags=["inspect"])
 app.include_router(admin_logs.router, prefix="/api/admin", tags=["admin"])
+app.include_router(admin_settings.router, prefix="/api/admin", tags=["admin"])

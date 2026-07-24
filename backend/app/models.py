@@ -44,6 +44,12 @@ class Cluster(Base):
     host: Mapped[str] = mapped_column(String(256), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=8000)
     token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    # Set only when token_encrypted holds a Qumulo access token this app
+    # created (not a raw pasted token) -- token_id lets us revoke it later,
+    # token_expires_at is None for a never-expiring access token or an
+    # unknown-lifetime pasted token (see clusters.py's login/create-token flow).
+    token_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     insecure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -95,3 +101,17 @@ class WarmTree(Base):
     __table_args__ = (
         UniqueConstraint("cluster_id", "source_file_id", name="uq_warm_trees_cluster_tree"),
     )
+
+
+class AppSettings(Base):
+    """Single-row table of app-wide settings an admin can change at runtime
+    (as opposed to the env-var settings in app/config.py, fixed at deploy
+    time). Row id=1 is the only row that will ever exist -- see
+    app/routers/admin_settings.py's get-or-create helper."""
+
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Lifetime of the Qumulo access tokens this app derives from a
+    # username+password login (see clusters.py). None means "never expires".
+    access_token_lifetime_days: Mapped[int | None] = mapped_column(Integer, nullable=True)

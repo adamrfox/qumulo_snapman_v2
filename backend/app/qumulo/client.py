@@ -131,3 +131,66 @@ def login(
                 description=data.get("description", f"HTTP {resp.status_code}"),
             )
         return resp.json()["bearer_token"]
+
+
+def _bearer_request(
+    method: str, host: str, port: int, bearer_token: str, path: str,
+    body: dict | None = None, insecure: bool = False, timeout: float = 30.0,
+):
+    if insecure:
+        warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+    with httpx.Client(
+        base_url=f"https://{host}:{port}",
+        headers={"Authorization": f"Bearer {bearer_token}"},
+        verify=not insecure,
+        timeout=timeout,
+    ) as client:
+        resp = client.request(method, path, json=body)
+        if resp.status_code >= 400:
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            raise ApiError(
+                status_code=resp.status_code,
+                error_class=data.get("error_class", ""),
+                description=data.get("description", f"HTTP {resp.status_code}"),
+            )
+        return resp.json() if resp.content else {}
+
+
+def who_am_i(host: str, port: int, bearer_token: str, insecure: bool = False, timeout: float = 30.0) -> dict:
+    """The identity a bearer token authenticates as -- used to derive the
+    identity reference /v1/auth/access-tokens/ needs (its "user" field
+    requires a name/auth_id/sid/uid/gid, not the plain "id" who-am-i also
+    returns; "sid" is the one that's worked in testing)."""
+    return _bearer_request("GET", host, port, bearer_token, "/v1/session/who-am-i", insecure=insecure, timeout=timeout)
+
+
+def create_access_token(
+    host: str, port: int, bearer_token: str, identity: dict,
+    expiration_time: str | None, insecure: bool = False, timeout: float = 30.0,
+) -> tuple[str, str]:
+    """Create a Qumulo access token (distinct from -- and not subject to the
+    fixed lifetime of -- a /v1/session/login session token). expiration_time
+    is an optional ISO 8601 'Z' string; omitting it creates a token that
+    never expires. Returns (token_id, bearer_token)."""
+    body: dict = {"user": identity}
+    if expiration_time is not None:
+        body["expiration_time"] = expiration_time
+    result = _bearer_request(
+        "POST", host, port, bearer_token, "/v1/auth/access-tokens/", body, insecure=insecure, timeout=timeout
+    )
+    return result["id"], result["bearer_token"]
+
+
+def revoke_access_token(
+    host: str, port: int, bearer_token: str, token_id: str, insecure: bool = False, timeout: float = 30.0
+) -> None:
+    """Revoke an access token this app created. Raises ApiError/etc on
+    failure like every other function here -- callers that consider this
+    best-effort (e.g. replacing a cluster's credentials) are responsible for
+    swallowing that themselves, same as any other "nice to have" cleanup."""
+    _bearer_request(
+        "DELETE", host, port, bearer_token, f"/v1/auth/access-tokens/{token_id}", insecure=insecure, timeout=timeout
+    )

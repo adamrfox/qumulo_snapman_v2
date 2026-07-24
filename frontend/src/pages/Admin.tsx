@@ -20,9 +20,39 @@ export default function Admin() {
   const [downloadingLogs, setDownloadingLogs] = useState(false)
   const [downloadError, setDownloadError] = useState('')
 
+  const [lifetimeDays, setLifetimeDays] = useState('365')
+  const [neverExpire, setNeverExpire] = useState(false)
+  const [savingSettings, setSavingSettings] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
+  const [settingsSaved, setSettingsSaved] = useState(false)
+
   useEffect(() => {
     api.users.list().then(setUsers).catch(() => {})
+    api.admin.getSettings().then(({ access_token_lifetime_days }) => {
+      setNeverExpire(access_token_lifetime_days === null)
+      if (access_token_lifetime_days !== null) setLifetimeDays(String(access_token_lifetime_days))
+    }).catch(() => {})
   }, [])
+
+  async function saveSettings(e: React.FormEvent) {
+    e.preventDefault()
+    setSettingsError('')
+    setSettingsSaved(false)
+    const days = neverExpire ? null : Number(lifetimeDays)
+    if (days !== null && (!Number.isFinite(days) || days <= 0)) {
+      setSettingsError('Enter a positive number of days, or check "Never expire"')
+      return
+    }
+    setSavingSettings(true)
+    try {
+      await api.admin.updateSettings(days)
+      setSettingsSaved(true)
+    } catch (err: unknown) {
+      setSettingsError(err instanceof Error ? err.message : 'Failed to save')
+    } finally {
+      setSavingSettings(false)
+    }
+  }
 
   async function downloadDiagnostics() {
     setDownloadError('')
@@ -178,6 +208,48 @@ export default function Admin() {
           </button>
           {downloadError && <p className="text-sm text-pomegranate-400">{downloadError}</p>}
         </div>
+      </div>
+
+      <div className="mt-8">
+        <h2 className="mb-1 text-lg font-light text-lychee-100">Cluster authentication</h2>
+        <p className="mb-3 text-sm text-lychee-400">
+          When a cluster is registered with a username and password, snapman exchanges that login
+          for a Qumulo access token and stores that instead of the raw session token -- session
+          tokens expire on a fixed schedule outside this app's control, which silently breaks
+          keep-warm and any other background use once they do. This controls how long those
+          derived access tokens live. Only affects clusters added or updated with username/password
+          after this is changed; a cluster registered by pasting a bearer token directly is
+          unaffected.
+        </p>
+        <form onSubmit={saveSettings} className="flex flex-wrap items-center gap-3">
+          <input
+            type="number"
+            min={1}
+            step="1"
+            value={lifetimeDays}
+            onChange={e => setLifetimeDays(e.target.value)}
+            disabled={neverExpire}
+            className="w-24 rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500 disabled:opacity-40"
+          />
+          <span className="text-sm text-lychee-400">days</span>
+          <label className="flex items-center gap-2 text-sm text-lychee-400">
+            <input
+              type="checkbox"
+              checked={neverExpire}
+              onChange={e => setNeverExpire(e.target.checked)}
+            />
+            Never expire
+          </label>
+          <button
+            type="submit"
+            disabled={savingSettings}
+            className="rounded-md border border-blackberry-700 px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
+          >
+            {savingSettings ? 'Saving…' : 'Save'}
+          </button>
+          {settingsSaved && <span className="text-sm text-kiwi-400">Saved</span>}
+          {settingsError && <span className="text-sm text-pomegranate-400">{settingsError}</span>}
+        </form>
       </div>
 
       {showCreate && (
