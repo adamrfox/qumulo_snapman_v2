@@ -218,6 +218,14 @@ export default function GoalModal({
     const sourceFileIds = groups
       .filter(g => !nextExcluded.has(g.source_file_id))
       .map(g => g.source_file_id)
+    if (sourceFileIds.length === 0) {
+      // Nothing left to solve with once the only remaining contributor is
+      // excluded -- the backend rejects an empty source_file_ids list
+      // outright (400), so treat this the same as "no alternative found"
+      // instead of making a request that can only fail.
+      setNoMoreAlternatives(true)
+      return
+    }
     runSolve(sourceFileIds, nextExcluded)
   }
 
@@ -376,6 +384,11 @@ export default function GoalModal({
 
         {phase === 'results' && result && (
           <>
+            {error && (
+              <div className="mb-4 rounded-md border border-pomegranate-700 bg-pomegranate-700/20 p-3 text-sm text-pomegranate-400">
+                {error}
+              </div>
+            )}
             <div
               className={`mb-4 rounded-md border p-3 text-sm ${
                 result.goal_met
@@ -387,6 +400,12 @@ export default function GoalModal({
                 ? <>Goal met — up to <strong>{fmtBytes(result.total_freed_bytes)}</strong> reclaimable.</>
                 : <>Fell short by <strong>{fmtBytes(result.shortfall)}</strong> — only <strong>{fmtBytes(result.total_freed_bytes)}</strong> reclaimable from the trees considered.</>}
             </div>
+
+            {noMoreAlternatives && (
+              <div className="mb-4 rounded-md border border-kumquat-700 bg-kumquat-700/20 p-3 text-sm text-kumquat-400">
+                No further alternative found — excluding one more tree can no longer reach the goal. Showing the plan above.
+              </div>
+            )}
 
             {excludedIds.size > 0 && (
               <p className="mb-4 text-xs text-lychee-500">
@@ -456,28 +475,19 @@ export default function GoalModal({
               </table>
             </div>
 
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-xs text-lychee-500">
-                {noMoreAlternatives && (
-                  <span title="Excluding one more tree from the current plan can no longer reach the goal.">
-                    No further alternative found.
-                  </span>
-                )}
-              </div>
-              <div className="flex gap-2">
-                {result.goal_met && !noMoreAlternatives && biggestContributor() && (
-                  <button
-                    onClick={tryDifferentCombination}
-                    title="Exclude this plan's biggest contributor and re-solve with what's left, to see if the goal is still reachable another way"
-                    className="rounded-md border border-blackberry-700 px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850"
-                  >
-                    Try a different combination
-                  </button>
-                )}
-                <button onClick={onClose} className="rounded-md px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850">
-                  Close
+            <div className="flex justify-end gap-2">
+              {result.goal_met && !noMoreAlternatives && biggestContributor() && (
+                <button
+                  onClick={tryDifferentCombination}
+                  title="Exclude this plan's biggest contributor and re-solve with what's left, to see if the goal is still reachable another way"
+                  className="rounded-md border border-blackberry-700 px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850"
+                >
+                  Try a different combination
                 </button>
-              </div>
+              )}
+              <button onClick={onClose} className="rounded-md px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850">
+                Close
+              </button>
             </div>
           </>
         )}
