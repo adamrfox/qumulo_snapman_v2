@@ -70,6 +70,22 @@ triggered by checking multiple rows in the Snapshot sizes table and clicking
 algebraically to exactly the individual-size number from question 2 — it's a
 generalization, not a competing calculation.
 
+### 4. "I need to free up N — what should I delete, and where?"
+
+The inverse of the questions above: given a target byte count spanning multiple
+trees at once, which cuts get there while sacrificing the least history? Answered by
+the **space-goal solver** — pick a target size and one or more trees, and it greedily
+takes whichever available cut is cheapest (most bytes freed per day of history given
+up) next, across all selected trees, until the target is met. Cuts are intentionally
+uneven across trees: one that frees a lot for little history sacrificed gets cut
+deeper than one that doesn't. A cleanup pass then drops any step that turns out
+unnecessary once a costlier-but-required step already covers the goal on its own.
+Trees that have never been Inspected are Inspected automatically, one at a time, as
+part of solving. Triggered by **Solve for a space goal** on the Dashboard, after
+checking one or more trees; "Try a different combination" excludes the plan's
+biggest contributor and re-solves with what's left, for cases where you'd rather not
+touch it.
+
 ### Held snapshots
 
 A snapshot that's **locked** or **replication-owned** can't be deleted through this
@@ -107,11 +123,14 @@ backend` in that case).
 
 - Left sidebar: your registered clusters (all of them, if you're an admin; just your
   own otherwise). Add a cluster with either a bearer token or a Qumulo
-  username/password (exchanged server-side for a session token — credentials
-  themselves are never stored, only the resulting token, encrypted at rest). Hover a
-  cluster for **Edit** (including rotating its credentials) and **Delete**.
+  username/password — credentials themselves are never stored; a username/password is
+  immediately exchanged server-side for a Qumulo **access token** instead (not a
+  session token, which has a short, fixed lifetime outside this app's control), and
+  only that, encrypted at rest, is kept. Hover a cluster for **Edit** (including
+  rotating its credentials) and **Delete**.
 - Main panel, once a cluster is selected: every snapshotted source path ("tree") on
-  that cluster, with:
+  that cluster, with a checkbox per row (plus **select all**) to pick trees for
+  **Solve for a space goal** (top right — see the space-goal solver above), and:
   - **Snaps** — how many snapshots exist for that tree.
   - **Oldest** — age in days of the oldest one.
   - **Prunable** — how many snapshots, counted from the oldest, are older than the
@@ -124,6 +143,9 @@ backend` in that case).
   - **Reclaim~** — bytes freed by the *measured* portion of the prunable prefix,
     stopping at the first unmeasured one. A floor, not an estimate — click into a
     tree and run Inspect to get the real, complete number.
+  - **Keep warm** — opt this tree into continuous background re-Inspection (see
+    Architecture below), so its reclaim curve is already fresh next time anyone
+    looks at it or includes it in a goal, instead of waiting on an on-demand scan.
   - **Refresh** (top right) — bypass the 5-minute snapshot-listing cache and re-fetch
     from the cluster right now.
 
@@ -147,8 +169,14 @@ diff doesn't cost you the results already computed for the rest of the tree.
 
 ### Admin (admin role only)
 
-Create users, change roles, and activate/deactivate accounts. Any user can change
-their own password (Layout header) with current-password verification.
+Create users, change roles, and activate/deactivate accounts. **Download
+diagnostics** bundles the backend log, nginx logs, and the current browser session's
+console output into one file for troubleshooting. **Cluster authentication** sets how
+long an access token derived from a username/password login lives before it needs to
+be re-issued (default 365 days; can be set to never expire) — only affects clusters
+added or updated with username/password after the setting changes, not ones
+registered by pasting a bearer token directly. Any user can change their own password
+(Layout header) with current-password verification.
 
 ## Architecture
 
@@ -163,6 +191,15 @@ Three containers via Docker Compose:
 No Redis, no task queue — on-demand background jobs are plain `asyncio.create_task` +
 a thread-pool executor for the sync Qumulo API calls, tracked in an in-process job
 registry (`app/jobs.py`) and streamed to the browser over Server-Sent Events.
+
+A second, independent path runs *unprompted*: **Keep warm** trees (`app/warm_sweep.py`)
+are re-Inspected on a fixed interval by one long-lived supervised task per cluster
+that has at least one opted-in tree — still no Redis/queue, just a longer-lived task
+instead of a one-shot job, spawned and retired by a lightweight supervisor as opt-ins
+come and go. The opt-in list (`warm_trees` table) is the only state that needs to
+survive a restart; the sweep just picks back up from it. A tree that's already fully
+measured, permanently blocked by a held snapshot, or currently being Inspected by
+someone else is skipped rather than rescanned every pass.
 
 **Backend stack**: FastAPI, SQLAlchemy (async) + asyncpg, Alembic migrations, PyJWT,
 `cryptography` (Fernet, for encrypting stored Qumulo tokens), httpx.
@@ -233,8 +270,9 @@ docker compose up -d --build
 
 Then open `http://localhost:3003` (or whatever `APP_PORT` you set), log in as
 `admin` with the password you set, and add your first cluster from the Dashboard —
-either a Qumulo bearer token (`qq auth_create_access_token`) or a
-username/password, which the app exchanges for a session token server-side.
+either a Qumulo bearer token (`qq auth_create_access_token`) or a username/password,
+which the app immediately exchanges for its own longer-lived Qumulo access token
+server-side (see Admin's **Cluster authentication** setting for how long it lives).
 
 Database migrations run automatically on container start
 (`alembic upgrade head`, see the backend `CMD`).
