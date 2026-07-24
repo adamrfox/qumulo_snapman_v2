@@ -465,7 +465,7 @@ export default function GoalModal({
                 )}
               </div>
               <div className="flex gap-2">
-                {result.goal_met && !noMoreAlternatives && (
+                {result.goal_met && !noMoreAlternatives && biggestContributor() && (
                   <button
                     onClick={tryDifferentCombination}
                     title="Exclude this plan's biggest contributor and re-solve with what's left, to see if the goal is still reachable another way"
