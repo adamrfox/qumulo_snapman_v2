@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, model_validator
@@ -63,7 +63,10 @@ async def _login_and_create_access_token(
     expiration: str | None = None
     expires_at: datetime | None = None
     if lifetime_days:
-        expires_at = datetime.now(timezone.utc) + timedelta(days=lifetime_days)
+        # Naive-but-UTC, matching every other datetime column in this app
+        # (see to_utc_iso) -- token_expires_at is TIMESTAMP WITHOUT TIME ZONE,
+        # which asyncpg refuses to accept a tz-aware value for.
+        expires_at = datetime.utcnow() + timedelta(days=lifetime_days)
         expiration = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     token_id, bearer_token = await loop.run_in_executor(
