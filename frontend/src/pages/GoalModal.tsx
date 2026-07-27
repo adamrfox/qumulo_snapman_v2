@@ -50,7 +50,14 @@ export default function GoalModal({
 }: Props) {
   const navigate = useNavigate()
   const [phase, setPhase] = useState<Phase>(initialResult ? 'results' : 'input')
-  const [amount, setAmount] = useState('')
+  // When reopened after a "Review & delete" round trip (Dashboard.tsx passes
+  // initialResult), this modal never showed the input screen, so amount
+  // would otherwise stay '' -- targetBytes() then treats it as 0 and any
+  // later "Try a different combination" click silently bails out before
+  // ever making a request. Re-derive it from the goal that was actually
+  // solved for, in GiB regardless of what unit was originally picked --
+  // dividing and re-multiplying by the same factor round-trips exactly.
+  const [amount, setAmount] = useState(initialResult ? String(initialResult.target_bytes / UNITS.GiB) : '')
   const [unit, setUnit] = useState<Unit>('GiB')
   const [error, setError] = useState('')
   const [statusMsg, setStatusMsg] = useState('')
