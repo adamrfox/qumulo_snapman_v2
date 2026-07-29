@@ -207,16 +207,29 @@ async def list_warm_trees(
 ):
     await get_authorized_cluster(cluster_id, user, db)
     result = await db.execute(select(WarmTree).where(WarmTree.cluster_id == cluster_id))
-    return {
-        "warm_trees": [
-            {
-                "source_file_id": w.source_file_id,
-                "last_swept_at": to_utc_iso(w.last_swept_at) if w.last_swept_at else None,
-                "last_error": w.last_error,
-            }
-            for w in result.scalars().all()
-        ]
-    }
+
+    def _progress(job: job_registry.InspectJob | None) -> dict | None:
+        if job is None or (job.last_pair_progress is None and job.last_sub_progress is None):
+            return None
+        return {
+            "pair_index": job.last_pair_progress["index"] if job.last_pair_progress else None,
+            "pair_total": job.last_pair_progress["total"] if job.last_pair_progress else None,
+            "found": job.last_sub_progress["found"] if job.last_sub_progress else None,
+            "sized": job.last_sub_progress["sized"] if job.last_sub_progress else None,
+        }
+
+    warm_trees = []
+    for w in result.scalars().all():
+        running_job = job_registry.find_running(cluster_id, w.source_file_id)
+        warm_trees.append({
+            "source_file_id": w.source_file_id,
+            "last_swept_at": to_utc_iso(w.last_swept_at) if w.last_swept_at else None,
+            "last_error": w.last_error,
+            "held_reason": w.held_reason,
+            "running": running_job is not None,
+            "progress": _progress(running_job),
+        })
+    return {"warm_trees": warm_trees}
 
 
 @router.put("/{cluster_id}/warm-trees/{source_file_id}")
@@ -653,24 +666,33 @@ def load_tree_status(cluster_snapshot: dict, cluster_name: str, source_file_id: 
         # If an unmeasured pair's older snapshot is locked/replication-held,
         # that's *why* -- Inspect skips held snapshots by default (their
         # size isn't actionable since they can't be deleted anyway), and
-        # that skip is never cached, so this tree can never reach 0
-        # unmeasured through an ordinary auto-inspect no matter how many
-        # times it's retried. Surface that instead of a generic "still
-        # incomplete" message so it's clear this isn't transient.
+        # that skip is never cached, so this specific pair can never reach
+        # 0 unmeasured through an ordinary auto-inspect no matter how many
+        # times it's retried. held_reason surfaces that instead of a
+        # generic "still incomplete" message. unmeasured_computable counts
+        # only the *other* unmeasured pairs -- the ones an Inspect run would
+        # actually measure -- so a caller can tell "every remaining pair is
+        # permanently blocked" (nothing to gain from running Inspect again)
+        # apart from "some pairs are held, but plenty of real work remains"
+        # (still worth launching Inspect, which skips just the held ones).
         held_reason = None
+        unmeasured_computable = 0
         if unmeasured > 0:
             snaps_by_id = {s.id: s for s in group.snapshots}
             for p in points:
                 if p["status"] in ("pending", "timed_out"):
                     snap = snaps_by_id.get(p["older_id"])
                     if snap is not None and snap.held:
-                        held_reason = snap.held_reason
-                        break
+                        if held_reason is None:
+                            held_reason = snap.held_reason
+                    else:
+                        unmeasured_computable += 1
 
         return {
             "path": path,
             "points": points,
             "unmeasured": unmeasured,
+            "unmeasured_computable": unmeasured_computable,
             "prunable": prunable,
             "held_reason": held_reason,
         }
@@ -703,6 +725,13 @@ async def _run_inspect_task(
     def push(event_type: str, data: dict) -> None:
         event = {"type": event_type, **data}
         job.last_event = event
+        if event_type == "pair_start":
+            job.last_pair_progress = {"index": data["index"], "total": data["total"]}
+            job.last_sub_progress = {"found": 0, "sized": 0}
+        elif event_type == "progress":
+            job.last_sub_progress = {"found": data["found"], "sized": data["sized"]}
+        elif event_type == "pair_finished" and job.last_pair_progress is not None:
+            job.last_pair_progress = {**job.last_pair_progress, "index": data["index"]}
         loop.call_soon_threadsafe(job.event_queue.put_nowait, event)
 
     def _worker():

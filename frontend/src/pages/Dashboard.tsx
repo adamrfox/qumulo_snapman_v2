@@ -5,21 +5,37 @@ import type { Cluster, GoalReturnState, GoalSkippedTree, SnapshotGroup, WarmTree
 import GoalModal from './GoalModal'
 import { downloadCsv, toCsv } from '../csv'
 
-function warmStatusDot(status: WarmTreeStatus | undefined): { color: string; title: string } {
-  if (!status) return { color: '', title: '' }
+function warmStatusInfo(status: WarmTreeStatus | undefined): { color: string; animate: boolean; text: string } {
+  if (!status) return { color: '', animate: false, text: '' }
+  if (status.running) {
+    const p = status.progress
+    const detail = p && p.pair_index !== null && p.pair_total !== null
+      ? ` — pair ${p.pair_index} of ${p.pair_total}${p.found !== null && p.sized !== null ? ` (${p.sized} of ${p.found} candidate files sized)` : ''}`
+      : ''
+    return { color: 'bg-agave-400', animate: true, text: `Currently sweeping this tree${detail}` }
+  }
+  if (status.held_reason) {
+    return {
+      color: 'bg-kumquat-400',
+      animate: false,
+      text: `Held (${status.held_reason}) — the background sweep skips this tree every pass and won't auto-refresh it until that clears`,
+    }
+  }
   if (status.last_error) {
     return {
       color: 'bg-pomegranate-400',
-      title: `Last keep-warm attempt failed${status.last_swept_at ? ` (${new Date(status.last_swept_at).toLocaleString()})` : ''}: ${status.last_error}`,
+      animate: false,
+      text: `Last keep-warm attempt failed${status.last_swept_at ? ` (${new Date(status.last_swept_at).toLocaleString()})` : ''}: ${status.last_error}`,
     }
   }
   if (status.last_swept_at) {
     return {
       color: 'bg-kiwi-400',
-      title: `Last kept warm ${new Date(status.last_swept_at).toLocaleString()}`,
+      animate: false,
+      text: `Last kept warm ${new Date(status.last_swept_at).toLocaleString()}`,
     }
   }
-  return { color: 'bg-lychee-500', title: 'Opted in — waiting for the first background sweep' }
+  return { color: 'bg-lychee-500', animate: false, text: 'Opted in — waiting for the first background sweep' }
 }
 
 function fmtBytes(n: number): string {
@@ -47,6 +63,8 @@ export default function Dashboard() {
   const [olderThanInput, setOlderThanInput] = useState('90')
   const [selectedTrees, setSelectedTrees] = useState<Set<string>>(new Set())
   const [warmTrees, setWarmTrees] = useState<Map<string, WarmTreeStatus>>(new Map())
+  const [hoveredWarmTree, setHoveredWarmTree] = useState<string | null>(null)
+  const warmHoverIntervalRef = useRef<number | null>(null)
   const [showGoalModal, setShowGoalModal] = useState(false)
   const [reopenGoal, setReopenGoal] = useState<GoalReturnState | null>(null)
   const [runningGoalJobId, setRunningGoalJobId] = useState<string | null>(null)
@@ -112,14 +130,45 @@ export default function Dashboard() {
     loadGroups(selectedId, olderThanDays)
   }, [selectedId, olderThanDays])
 
+  function refreshWarmTrees(id: string) {
+    api.inspect.warmTrees(id)
+      .then(r => setWarmTrees(new Map(r.warm_trees.map(w => [w.source_file_id, w]))))
+      .catch(() => {})
+  }
+
   useEffect(() => {
     setSelectedTrees(new Set())
     setWarmTrees(new Map())
     if (!selectedId) return
-    api.inspect.warmTrees(selectedId)
-      .then(r => setWarmTrees(new Map(r.warm_trees.map(w => [w.source_file_id, w]))))
-      .catch(() => {})
+    refreshWarmTrees(selectedId)
   }, [selectedId])
+
+  // Keep-warm status is a snapshot from the last fetch, not live -- rather
+  // than poll it constantly for every cluster page view, only refresh while
+  // the user is actually looking at a tree's status dot, so a running
+  // sweep's progress visibly ticks up on hover without wasting requests
+  // the rest of the time.
+  function startWarmHoverPoll(sourceFileId: string) {
+    if (!selectedId) return
+    setHoveredWarmTree(sourceFileId)
+    refreshWarmTrees(selectedId)
+    if (warmHoverIntervalRef.current !== null) window.clearInterval(warmHoverIntervalRef.current)
+    warmHoverIntervalRef.current = window.setInterval(() => refreshWarmTrees(selectedId), 2000)
+  }
+
+  function stopWarmHoverPoll() {
+    setHoveredWarmTree(null)
+    if (warmHoverIntervalRef.current !== null) {
+      window.clearInterval(warmHoverIntervalRef.current)
+      warmHoverIntervalRef.current = null
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      if (warmHoverIntervalRef.current !== null) window.clearInterval(warmHoverIntervalRef.current)
+    }
+  }, [])
 
   function toggleTree(sourceFileId: string) {
     setSelectedTrees(prev => {
@@ -139,7 +188,7 @@ export default function Dashboard() {
       setWarmTrees(prev => {
         const next = new Map(prev)
         if (isWarm) next.delete(sourceFileId)
-        else next.set(sourceFileId, { source_file_id: sourceFileId, last_swept_at: null, last_error: null })
+        else next.set(sourceFileId, { source_file_id: sourceFileId, last_swept_at: null, last_error: null, held_reason: null, running: false, progress: null })
         return next
       })
     } catch (e: unknown) {
@@ -672,8 +721,21 @@ export default function Dashboard() {
                                 title="Automatically keep this tree's reclaim curve refreshed in the background, even when nobody has the app open"
                               />
                               {warmTrees.has(g.source_file_id) && (() => {
-                                const dot = warmStatusDot(warmTrees.get(g.source_file_id))
-                                return <span className={`inline-block h-2 w-2 rounded-full ${dot.color}`} title={dot.title} />
+                                const info = warmStatusInfo(warmTrees.get(g.source_file_id))
+                                return (
+                                  <span
+                                    className="relative inline-flex"
+                                    onMouseEnter={() => startWarmHoverPoll(g.source_file_id)}
+                                    onMouseLeave={stopWarmHoverPoll}
+                                  >
+                                    <span className={`inline-block h-2 w-2 rounded-full ${info.color} ${info.animate ? 'animate-pulse' : ''}`} />
+                                    {hoveredWarmTree === g.source_file_id && (
+                                      <span className="absolute top-full right-0 z-20 mt-1.5 w-56 rounded-md border border-blackberry-700 bg-blackberry-925 px-2 py-1.5 text-left text-xs font-normal normal-case text-lychee-300 shadow-lg">
+                                        {info.text}
+                                      </span>
+                                    )}
+                                  </span>
+                                )
                               })()}
                             </div>
                           </td>

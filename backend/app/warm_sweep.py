@@ -102,7 +102,15 @@ async def _cluster_sweep_loop(cluster_id: str) -> None:
             pass
 
 
-async def _record_sweep_result(warm_tree_id: str, error: str | None) -> None:
+# Sentinel distinguishing "leave held_reason as whatever it already was"
+# (e.g. a transient load_tree_status failure tells us nothing about held
+# status) from "set it to this value, including clearing it back to None".
+_HELD_REASON_UNCHANGED = object()
+
+
+async def _record_sweep_result(
+    warm_tree_id: str, error: str | None, held_reason: str | None | object = _HELD_REASON_UNCHANGED
+) -> None:
     """Persists the outcome of one sweep attempt onto its WarmTree row so the
     warm-trees list endpoint can show the user whether keep-warm is actually
     working for a tree, not just that it's opted in."""
@@ -112,6 +120,8 @@ async def _record_sweep_result(warm_tree_id: str, error: str | None) -> None:
             return  # opted out or cluster deleted mid-sweep
         row.last_swept_at = datetime.utcnow()
         row.last_error = error
+        if held_reason is not _HELD_REASON_UNCHANGED:
+            row.held_reason = held_reason
         await db.commit()
 
 
@@ -182,13 +192,21 @@ async def _sweep_cluster_once(cluster_id: str, warm_trees: list[WarmTree]) -> No
                     await db.commit()
             continue
 
-        if info["held_reason"] is not None:
-            # Permanently blocked -- re-launching every pass forever would
-            # waste real Qumulo load for zero benefit (see load_tree_status).
+        if info["unmeasured"] == 0:
+            await _record_sweep_result(warm_tree.id, None, held_reason=None)
             continue
 
-        if info["unmeasured"] == 0:
-            await _record_sweep_result(warm_tree.id, None)
+        if info["unmeasured_computable"] == 0:
+            # Every remaining unmeasured pair is blocked by a held/locked
+            # snapshot -- Inspect would just rediscover the exact same skip,
+            # so there's truly nothing to gain from launching it (see
+            # load_tree_status). Still record that we checked, so the
+            # status dot can show "held" instead of an indefinite,
+            # misleading "never swept yet". If only *some* pairs were held,
+            # we fall through below instead -- Inspect measures everything
+            # it can and skips just the held ones on its own, so a tree with
+            # one blocked ancestor still gets the rest of its curve kept warm.
+            await _record_sweep_result(warm_tree.id, None, held_reason=info["held_reason"])
             continue
 
         async with SessionLocal() as db:
@@ -216,4 +234,4 @@ async def _sweep_cluster_once(cluster_id: str, warm_trees: list[WarmTree]) -> No
                 db_job = await db.get(InspectJob, job.id)
                 if db_job is not None and db_job.status == "error":
                     sweep_error = db_job.error_message
-        await _record_sweep_result(warm_tree.id, sweep_error)
+        await _record_sweep_result(warm_tree.id, sweep_error, held_reason=None)

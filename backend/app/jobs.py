@@ -28,6 +28,13 @@ class InspectJob:
     # draining events out from under whichever consumer actually owns this
     # job's queue (its own SSE stream, or another tab watching it directly).
     last_event: dict | None = None
+    # Coherent pair/file progress snapshot, updated alongside last_event but
+    # surviving past whichever single event happened to be pushed last --
+    # e.g. a "pair_finished" event alone doesn't carry the pair's total, so a
+    # consumer that only ever reads the *latest* raw event can lose track of
+    # it. {"index": int, "total": int} / {"found": int, "sized": int}.
+    last_pair_progress: dict | None = None
+    last_sub_progress: dict | None = None
 
 
 _registry: dict[str, InspectJob] = {}

@@ -97,6 +97,7 @@ class WarmTree(Base):
     )
     last_swept_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    held_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     cluster: Mapped["Cluster"] = relationship("Cluster", back_populates="warm_trees")
 

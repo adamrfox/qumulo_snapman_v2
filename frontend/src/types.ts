@@ -71,10 +71,20 @@ export interface LastRun {
   finished_at: string | null
 }
 
+export interface WarmTreeProgress {
+  pair_index: number | null
+  pair_total: number | null
+  found: number | null
+  sized: number | null
+}
+
 export interface WarmTreeStatus {
   source_file_id: string
   last_swept_at: string | null
   last_error: string | null
+  held_reason: string | null
+  running: boolean
+  progress: WarmTreeProgress | null
 }
 
 export interface TreeAllocation {
