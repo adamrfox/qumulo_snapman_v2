@@ -22,6 +22,12 @@ class InspectJob:
     task: asyncio.Task | None = None
     done: bool = False
     cancel_requested: bool = False
+    # Latest event pushed, kept outside the queue -- a second, later consumer
+    # (e.g. the goal solver/measure-trees loop finding this job already
+    # running via find_running) can read the current progress here without
+    # draining events out from under whichever consumer actually owns this
+    # job's queue (its own SSE stream, or another tab watching it directly).
+    last_event: dict | None = None
 
 
 _registry: dict[str, InspectJob] = {}

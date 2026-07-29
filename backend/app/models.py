@@ -95,6 +95,8 @@ class WarmTree(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
+    last_swept_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     cluster: Mapped["Cluster"] = relationship("Cluster", back_populates="warm_trees")
 

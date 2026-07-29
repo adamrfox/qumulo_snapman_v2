@@ -1,8 +1,26 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { api, ClusterAuthError, UnsupportedClusterVersionError } from '../api'
-import type { Cluster, GoalReturnState, SnapshotGroup } from '../types'
+import type { Cluster, GoalReturnState, GoalSkippedTree, SnapshotGroup, WarmTreeStatus } from '../types'
 import GoalModal from './GoalModal'
+import { downloadCsv, toCsv } from '../csv'
+
+function warmStatusDot(status: WarmTreeStatus | undefined): { color: string; title: string } {
+  if (!status) return { color: '', title: '' }
+  if (status.last_error) {
+    return {
+      color: 'bg-pomegranate-400',
+      title: `Last keep-warm attempt failed${status.last_swept_at ? ` (${new Date(status.last_swept_at).toLocaleString()})` : ''}: ${status.last_error}`,
+    }
+  }
+  if (status.last_swept_at) {
+    return {
+      color: 'bg-kiwi-400',
+      title: `Last kept warm ${new Date(status.last_swept_at).toLocaleString()}`,
+    }
+  }
+  return { color: 'bg-lychee-500', title: 'Opted in — waiting for the first background sweep' }
+}
 
 function fmtBytes(n: number): string {
   if (n === 0) return '—'
@@ -28,9 +46,21 @@ export default function Dashboard() {
   const [olderThanDays, setOlderThanDays] = useState(90)
   const [olderThanInput, setOlderThanInput] = useState('90')
   const [selectedTrees, setSelectedTrees] = useState<Set<string>>(new Set())
-  const [warmTrees, setWarmTrees] = useState<Set<string>>(new Set())
+  const [warmTrees, setWarmTrees] = useState<Map<string, WarmTreeStatus>>(new Map())
   const [showGoalModal, setShowGoalModal] = useState(false)
   const [reopenGoal, setReopenGoal] = useState<GoalReturnState | null>(null)
+  const [runningGoalJobId, setRunningGoalJobId] = useState<string | null>(null)
+
+  const [measuring, setMeasuring] = useState(false)
+  const [measureProgress, setMeasureProgress] = useState<{ current: number; total: number } | null>(null)
+  const [measureCurrentPath, setMeasureCurrentPath] = useState('')
+  const [measurePairProgress, setMeasurePairProgress] = useState<{ current: number; total: number } | null>(null)
+  const [measureSubProgress, setMeasureSubProgress] = useState<{ found: number; sized: number } | null>(null)
+  const [measureSkipped, setMeasureSkipped] = useState<GoalSkippedTree[]>([])
+  const [measureStatusMsg, setMeasureStatusMsg] = useState('')
+  const [measureError, setMeasureError] = useState('')
+  const [showFleetExportWarning, setShowFleetExportWarning] = useState(false)
+  const exportAfterMeasureRef = useRef(false)
 
   useEffect(() => {
     const reopen: GoalReturnState | undefined = location.state?.reopenGoal
@@ -84,10 +114,10 @@ export default function Dashboard() {
 
   useEffect(() => {
     setSelectedTrees(new Set())
-    setWarmTrees(new Set())
+    setWarmTrees(new Map())
     if (!selectedId) return
     api.inspect.warmTrees(selectedId)
-      .then(r => setWarmTrees(new Set(r.source_file_ids)))
+      .then(r => setWarmTrees(new Map(r.warm_trees.map(w => [w.source_file_id, w]))))
       .catch(() => {})
   }, [selectedId])
 
@@ -107,9 +137,9 @@ export default function Dashboard() {
       if (isWarm) await api.inspect.removeWarmTree(selectedId, sourceFileId)
       else await api.inspect.addWarmTree(selectedId, sourceFileId)
       setWarmTrees(prev => {
-        const next = new Set(prev)
+        const next = new Map(prev)
         if (isWarm) next.delete(sourceFileId)
-        else next.add(sourceFileId)
+        else next.set(sourceFileId, { source_file_id: sourceFileId, last_swept_at: null, last_error: null })
         return next
       })
     } catch (e: unknown) {
@@ -222,6 +252,156 @@ export default function Dashboard() {
     }
   }
 
+  // total_pairs > 0 excludes single-snapshot trees -- there's nothing to
+  // measure there, so they shouldn't count as "incomplete."
+  const incompleteGroups = groups.filter(g => g.total_pairs > 0 && g.measured_pairs < g.total_pairs)
+
+  function exportFleetCsv(gs: SnapshotGroup[] = groups) {
+    const sorted = [...gs].sort((a, b) => b.reclaim_bytes - a.reclaim_bytes)
+    const csv = toCsv(
+      ['path', 'snapshot_count', 'oldest_age_days', 'prunable_count', 'measured_pairs', 'total_pairs', 'fully_measured', 'reclaim_bytes', 'is_upper_bound', 'held_reason'],
+      sorted.map(g => [
+        g.path, g.count, g.max_age_days, g.prunable,
+        g.measured_pairs, g.total_pairs, g.measured_pairs >= g.total_pairs ? 'yes' : 'no',
+        g.reclaim_bytes, g.is_upper_bound ? 'yes' : 'no', g.held_reason,
+      ])
+    )
+    const namePart = (clusterName || 'cluster').replace(/[^a-zA-Z0-9._-]+/g, '_')
+    downloadCsv(`fleet-summary-${namePart}-${olderThanDays}d-${new Date().toISOString().slice(0, 10)}.csv`, csv)
+  }
+
+  function handleExportFleetClick() {
+    if (incompleteGroups.length > 0) setShowFleetExportWarning(true)
+    else exportFleetCsv()
+  }
+
+  // Shared by starting a fresh bulk measure (startMeasureRemaining, below)
+  // and by reattaching to one this component instance didn't start itself
+  // (see the reattach effect below it) -- both just need to watch an
+  // already-created job's stream the same way.
+  function attachToMeasureStream(jobId: string) {
+    if (!selectedId) return
+    const es = new EventSource(`/api/clusters/${selectedId}/jobs/${jobId}/stream`, { withCredentials: true })
+    es.onmessage = (evt) => {
+      const msg = JSON.parse(evt.data)
+      switch (msg.type) {
+        case 'tree_start':
+          setMeasureProgress({ current: msg.index, total: msg.total })
+          setMeasureCurrentPath(msg.path)
+          setMeasurePairProgress(null)
+          setMeasureSubProgress(null)
+          setMeasureStatusMsg(`Measuring tree ${msg.index + 1} of ${msg.total}…`)
+          break
+        case 'tree_measured':
+          setMeasureStatusMsg('Already measured — moving on…')
+          break
+        case 'tree_skipped':
+          setMeasureSkipped(prev => [...prev, { source_file_id: msg.source_file_id, reason: msg.reason }])
+          break
+        case 'inspect_progress':
+          // waiting and a nested event aren't mutually exclusive: this
+          // tree's Inspect run may have been started elsewhere (another
+          // tab, or before this page was left and come back to), in
+          // which case msg.event carries that run's most recently
+          // observed progress even while we're just polling for it.
+          if (msg.waiting) {
+            setMeasureStatusMsg('Waiting for an in-progress Inspect run on this tree (started elsewhere)…')
+          }
+          if (msg.event?.type === 'pair_start') {
+            if (!msg.waiting) setMeasureStatusMsg(`Inspecting — measuring ${msg.event.total} pairs…`)
+            setMeasurePairProgress({ current: msg.event.index, total: msg.event.total })
+            setMeasureSubProgress({ found: 0, sized: 0 })
+          } else if (msg.event?.type === 'progress') {
+            setMeasureSubProgress({ found: msg.event.found, sized: msg.event.sized })
+          } else if (msg.event?.type === 'pair_finished') {
+            setMeasurePairProgress(prev => prev ? { ...prev, current: msg.event.index } : prev)
+          }
+          break
+        case 'finish':
+          es.close()
+          setMeasuring(false)
+          setMeasureStatusMsg('')
+          api.inspect.groups(selectedId, olderThanDays)
+            .then(r => {
+              setGroups(r.groups)
+              setClusterName(r.cluster_name)
+              if (exportAfterMeasureRef.current) {
+                exportAfterMeasureRef.current = false
+                exportFleetCsv(r.groups)
+              }
+            })
+            .catch(() => {})
+          break
+        case 'error':
+          es.close()
+          setMeasuring(false)
+          setMeasureError(msg.message)
+          exportAfterMeasureRef.current = false
+          break
+      }
+    }
+    es.onerror = () => {
+      es.close()
+      setMeasuring(false)
+      setMeasureError('Stream disconnected.')
+      exportAfterMeasureRef.current = false
+    }
+  }
+
+  function startMeasureRemaining(sourceFileIds: string[]) {
+    if (!selectedId) return
+    setMeasureError('')
+    setMeasureSkipped([])
+    setMeasureProgress(null)
+    setMeasureCurrentPath('')
+    setMeasurePairProgress(null)
+    setMeasureSubProgress(null)
+    setMeasuring(true)
+    setMeasureStatusMsg('Starting…')
+
+    api.inspect.measureTrees(selectedId, sourceFileIds)
+      .then(({ job_id }) => attachToMeasureStream(job_id))
+      .catch((err: unknown) => {
+        setMeasuring(false)
+        exportAfterMeasureRef.current = false
+        setMeasureError(err instanceof Error ? err.message : 'Failed to start')
+      })
+  }
+
+  function measureRemainingAndExport() {
+    exportAfterMeasureRef.current = true
+    startMeasureRemaining(incompleteGroups.map(g => g.source_file_id))
+  }
+
+  // A page reload (or leaving and coming back) loses all measure/goal
+  // progress state above, but the job keeps running server-side -- without
+  // this, the user would see nothing at all until they clicked the button
+  // again (and, for the measure flow, lose the pair/file detail this
+  // session never observed firsthand -- see the inspect_progress handling
+  // above). Check once per cluster selection for a job already in flight and
+  // reattach to it instead.
+  useEffect(() => {
+    if (!selectedId) return
+    api.inspect.runningMeasureTrees(selectedId)
+      .then(({ job_id }) => {
+        if (job_id) {
+          setMeasuring(true)
+          setMeasureStatusMsg('Reattached to an in-progress measurement…')
+          attachToMeasureStream(job_id)
+        }
+      })
+      .catch(() => {})
+    api.inspect.runningGoal(selectedId)
+      .then(({ job_id }) => {
+        if (job_id) {
+          setRunningGoalJobId(job_id)
+          setShowGoalModal(true)
+        }
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId])
+
   return (
     <div className="flex h-full">
       {/* Sidebar */}
@@ -308,6 +488,14 @@ export default function Dashboard() {
                   {refreshing ? 'Refreshing…' : 'Refresh'}
                 </button>
                 <button
+                  onClick={handleExportFleetClick}
+                  disabled={loadingGroups || groups.length === 0}
+                  title="Export this table as CSV"
+                  className="rounded-md border border-blackberry-700 px-3 py-1.5 text-xs text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
+                >
+                  Export fleet CSV
+                </button>
+                <button
                   onClick={() => setShowGoalModal(true)}
                   disabled={selectedTrees.size === 0}
                   title={selectedTrees.size === 0 ? 'Check one or more trees below first' : undefined}
@@ -352,6 +540,67 @@ export default function Dashboard() {
               </div>
             ) : (
               error && <p className="text-sm text-pomegranate-400">{error}</p>
+            )}
+
+            {measuring ? (
+              <div className="mb-4 rounded-lg border border-blackberry-700 bg-blackberry-900 p-4 text-sm">
+                <p className="mb-2 font-medium text-lychee-100">{measureStatusMsg}</p>
+                {measureProgress && (
+                  <>
+                    <div className="mb-1 flex justify-between text-xs text-lychee-400">
+                      <span>Tree {measureProgress.current + 1} of {measureProgress.total}{measureCurrentPath ? ` — ${measureCurrentPath}` : ''}</span>
+                    </div>
+                    <div className="mb-3 h-2 rounded-full bg-blackberry-800">
+                      <div
+                        className="h-2 rounded-full bg-agave-500 transition-all"
+                        style={{ width: `${Math.round((measureProgress.current / Math.max(measureProgress.total, 1)) * 100)}%` }}
+                      />
+                    </div>
+                  </>
+                )}
+                {measurePairProgress && (
+                  <p className="text-xs text-lychee-400">
+                    Pair {measurePairProgress.current + 1} of {measurePairProgress.total}
+                    {measureSubProgress ? ` — ${measureSubProgress.found} found · ${measureSubProgress.sized} sized` : ''}
+                  </p>
+                )}
+                {measureSkipped.length > 0 && (
+                  <ul className="mt-2 space-y-1 text-xs text-kumquat-500">
+                    {measureSkipped.map(s => (
+                      <li key={s.source_file_id}>Skipped: {s.reason}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : (
+              <>
+                {measureError && <p className="mb-4 text-sm text-pomegranate-400">{measureError}</p>}
+                {showFleetExportWarning && (
+                  <div className="mb-4 flex items-center justify-between rounded-md border border-kumquat-700 bg-kumquat-700/20 px-4 py-3 text-sm text-kumquat-400">
+                    <span>{incompleteGroups.length} of {groups.length} trees have unmeasured snapshot pairs — their reclaim figures (≤) are partial/estimated.</span>
+                    <div className="flex flex-shrink-0 gap-2">
+                      <button
+                        onClick={() => setShowFleetExportWarning(false)}
+                        className="rounded-md px-3 py-1 text-xs text-lychee-300 hover:bg-blackberry-850"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => { setShowFleetExportWarning(false); exportFleetCsv() }}
+                        className="rounded-md px-3 py-1 text-xs text-lychee-300 hover:bg-blackberry-850"
+                      >
+                        Export anyway
+                      </button>
+                      <button
+                        onClick={() => { setShowFleetExportWarning(false); measureRemainingAndExport() }}
+                        className="rounded-md bg-agave-500 px-3 py-1 text-xs text-blackberry-950 hover:bg-agave-600"
+                      >
+                        Measure remaining & export
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
 
             {!loadingGroups && !error && groups.length > 0 && (
@@ -414,13 +663,19 @@ export default function Dashboard() {
                               ? <span className="text-lychee-500">not measured</span>
                               : '—'}
                           </td>
-                          <td className="px-4 py-3 text-center" onClick={e => e.stopPropagation()}>
-                            <input
-                              type="checkbox"
-                              checked={warmTrees.has(g.source_file_id)}
-                              onChange={() => toggleWarmTree(g.source_file_id)}
-                              title="Automatically keep this tree's reclaim curve refreshed in the background, even when nobody has the app open"
-                            />
+                          <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center justify-center gap-1.5">
+                              <input
+                                type="checkbox"
+                                checked={warmTrees.has(g.source_file_id)}
+                                onChange={() => toggleWarmTree(g.source_file_id)}
+                                title="Automatically keep this tree's reclaim curve refreshed in the background, even when nobody has the app open"
+                              />
+                              {warmTrees.has(g.source_file_id) && (() => {
+                                const dot = warmStatusDot(warmTrees.get(g.source_file_id))
+                                return <span className={`inline-block h-2 w-2 rounded-full ${dot.color}`} title={dot.title} />
+                              })()}
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -666,12 +921,17 @@ export default function Dashboard() {
         <GoalModal
           clusterId={selectedId}
           clusterName={clusterName}
-          groups={reopenGoal ? reopenGoal.groups : groups.filter(g => selectedTrees.has(g.source_file_id))}
+          // Reattaching doesn't know which trees the original solve was
+          // scoped to (that selection lived in a session that's gone) --
+          // fall back to the full current group list so path lookups still
+          // resolve, rather than an empty selectedTrees-filtered set.
+          groups={reopenGoal ? reopenGoal.groups : runningGoalJobId ? groups : groups.filter(g => selectedTrees.has(g.source_file_id))}
           initialResult={reopenGoal?.result}
           initialSkipped={reopenGoal?.skipped}
           initialHandledIds={reopenGoal?.handledIds}
           initialExcludedIds={reopenGoal?.excludedIds}
-          onClose={() => { setShowGoalModal(false); setReopenGoal(null) }}
+          reattachJobId={runningGoalJobId ?? undefined}
+          onClose={() => { setShowGoalModal(false); setReopenGoal(null); setRunningGoalJobId(null) }}
           onDeselect={sourceFileId => setSelectedTrees(prev => {
             const next = new Set(prev)
             next.delete(sourceFileId)

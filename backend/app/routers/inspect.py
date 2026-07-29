@@ -207,7 +207,16 @@ async def list_warm_trees(
 ):
     await get_authorized_cluster(cluster_id, user, db)
     result = await db.execute(select(WarmTree).where(WarmTree.cluster_id == cluster_id))
-    return {"source_file_ids": [w.source_file_id for w in result.scalars().all()]}
+    return {
+        "warm_trees": [
+            {
+                "source_file_id": w.source_file_id,
+                "last_swept_at": to_utc_iso(w.last_swept_at) if w.last_swept_at else None,
+                "last_error": w.last_error,
+            }
+            for w in result.scalars().all()
+        ]
+    }
 
 
 @router.put("/{cluster_id}/warm-trees/{source_file_id}")
@@ -692,7 +701,9 @@ async def _run_inspect_task(
     error_message: str | None = None
 
     def push(event_type: str, data: dict) -> None:
-        loop.call_soon_threadsafe(job.event_queue.put_nowait, {"type": event_type, **data})
+        event = {"type": event_type, **data}
+        job.last_event = event
+        loop.call_soon_threadsafe(job.event_queue.put_nowait, event)
 
     def _worker():
         nonlocal error_message
@@ -782,6 +793,20 @@ class GoalRequest(BaseModel):
     target_bytes: int
 
 
+@router.get("/{cluster_id}/goal/running")
+async def get_running_goal(
+    cluster_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Lets a freshly loaded/reloaded page find an in-progress solve it didn't
+    start itself (or lost track of on reload) and reattach to its SSE stream,
+    rather than showing no progress at all until the user re-solves."""
+    await get_authorized_cluster(cluster_id, user, db)
+    job = job_registry.find_running(cluster_id, "*", job_type="goal")
+    return {"job_id": job.id if job is not None else None}
+
+
 @router.post("/{cluster_id}/goal", status_code=202)
 async def start_goal(
     cluster_id: str,
@@ -835,6 +860,151 @@ async def start_goal(
     return {"job_id": job.id}
 
 
+async def _measure_trees_loop(
+    push,
+    job: job_registry.InspectJob,
+    cluster_snapshot: dict,
+    cluster_id: str,
+    cluster_name: str,
+    source_file_ids: list[str],
+    started_by: str,
+) -> tuple[dict[str, dict], list[dict]]:
+    """Loads each tree's status and, for any with unmeasured pairs and no
+    held_reason, launches/awaits an Inspect run, relaying its events as
+    inspect_progress -- shared by the goal solver (_run_goal_task) and the
+    bulk "measure remaining trees" endpoint (_run_measure_trees_task), since
+    both need exactly this "make sure every listed tree is as measured as
+    it'll get" behavior. Trees run strictly one at a time. Returns
+    (info for every tree that ended up fully measured, in the order
+    processed; skipped list of {source_file_id, reason})."""
+    loop = asyncio.get_event_loop()
+    skipped: list[dict] = []
+
+    # A network blip while loading one tree shouldn't cost every other
+    # tree's already-computed result -- isolate per tree and skip just
+    # the one that failed, same as an unmeasurable tree is skipped below.
+    loaded: dict[str, dict] = {}
+    for sfid in source_file_ids:
+        try:
+            info = await loop.run_in_executor(None, load_tree_status, cluster_snapshot, cluster_name, sfid)
+        except Exception as e:
+            if is_cluster_wide_fatal(e):
+                raise
+            reason = str(e)
+            push("tree_skipped", {"source_file_id": sfid, "reason": reason})
+            skipped.append({"source_file_id": sfid, "reason": reason})
+            continue
+        if info is not None:
+            loaded[sfid] = info
+
+    # Order is UX-only (biggest wins surface first, the heaviest scans
+    # happen first so a cancel loses the least) -- it never affects the
+    # final allocation, which only runs once every tree is measured.
+    ordered = sorted(loaded, key=lambda sfid: loaded[sfid]["prunable"], reverse=True)
+    total = len(ordered)
+    measured: dict[str, dict] = {}
+
+    for index, sfid in enumerate(ordered):
+        if job.done:
+            break
+        info = loaded[sfid]
+        push(
+            "tree_start",
+            {"source_file_id": sfid, "path": info["path"], "index": index, "total": total},
+        )
+
+        try:
+            # held_reason means an unmeasured pair's older snapshot is
+            # locked/replication-held -- Inspect skips held snapshots by
+            # default, so launching one here can never bring unmeasured
+            # to 0 no matter how many times it's retried. Same reasoning
+            # the warm sweep already uses to give up on these (see
+            # load_tree_status): don't burn a live scan we already know
+            # is doomed, just fall through to the "skipped" branch below.
+            if info["unmeasured"] > 0 and info["held_reason"] is None:
+                # Trees run strictly one at a time -- this is the one part of
+                # this feature that does new, potentially heavy live Qumulo
+                # work, and nothing else in this app runs more than one such
+                # scan concurrently.
+                existing = job_registry.find_running(cluster_id, sfid)
+                if existing is not None:
+                    # Don't drain another consumer's queue -- another tab may
+                    # already be watching this Inspect run. Forward its most
+                    # recently observed event (kept outside the queue, see
+                    # InspectJob.last_event) so this consumer still sees real
+                    # pair/file progress instead of a bare "waiting" spinner.
+                    while not existing.done:
+                        push("inspect_progress", {"source_file_id": sfid, "waiting": True, "event": existing.last_event})
+                        await asyncio.sleep(2)
+                        if job.done:
+                            break
+                else:
+                    async with SessionLocal() as sub_db:
+                        sub_job = await launch_inspect_job(
+                            sub_db,
+                            cluster_id,
+                            cluster_name,
+                            cluster_snapshot,
+                            sfid,
+                            info["path"],
+                            started_by,
+                        )
+                    while True:
+                        if job.done:
+                            # Cancelling the outer run aborts whatever sub-
+                            # inspect is in flight too. Both flags matter:
+                            # .done actually stops run_inspect (should_stop),
+                            # .cancel_requested is what its own finally block
+                            # reads to record "cancelled" instead of
+                            # "completed" in the durable inspect_jobs row.
+                            sub_job.cancel_requested = True
+                            sub_job.done = True
+                        try:
+                            event = await asyncio.wait_for(
+                                sub_job.event_queue.get(), timeout=1.5
+                            )
+                            # Nested, not spread -- the sub-event has its own
+                            # "type" key (pair_start/progress/finish/...) that
+                            # would otherwise collide with and overwrite this
+                            # wrapper event's own "type": "inspect_progress".
+                            push("inspect_progress", {"source_file_id": sfid, "event": event})
+                            if event.get("type") in ("finish", "error"):
+                                break
+                        except asyncio.TimeoutError:
+                            pass
+                        if sub_job.done and sub_job.event_queue.empty():
+                            break
+
+                info = await loop.run_in_executor(None, load_tree_status, cluster_snapshot, cluster_name, sfid)
+        except Exception as e:
+            if is_cluster_wide_fatal(e):
+                raise
+            reason = str(e)
+            push("tree_skipped", {"source_file_id": sfid, "reason": reason})
+            skipped.append({"source_file_id": sfid, "reason": reason})
+            continue
+
+        if info is None or info["unmeasured"] > 0:
+            held_reason = info.get("held_reason") if info else None
+            if held_reason:
+                reason = (
+                    f'Contains a {held_reason} snapshot, which Inspect skips by default '
+                    f'since it can\'t actually be deleted. Re-inspect this tree directly '
+                    f'with "Include locked/replication-held snapshots" checked to have it '
+                    f'counted here.'
+                )
+            else:
+                reason = "Inspect did not finish measuring every pair -- see the backend log for details."
+            push("tree_skipped", {"source_file_id": sfid, "reason": reason})
+            skipped.append({"source_file_id": sfid, "reason": reason})
+            continue
+
+        push("tree_measured", {"source_file_id": sfid})
+        measured[sfid] = info
+
+    return measured, skipped
+
+
 async def _run_goal_task(
     job: job_registry.InspectJob,
     cluster_snapshot: dict,
@@ -852,128 +1022,11 @@ async def _run_goal_task(
     def push(event_type: str, data: dict) -> None:
         loop.call_soon_threadsafe(job.event_queue.put_nowait, {"type": event_type, **data})
 
-    skipped: list[dict] = []
-
     try:
-        # A network blip while loading one tree shouldn't cost every other
-        # tree's already-computed result -- isolate per tree and skip just
-        # the one that failed, same as an unmeasurable tree is skipped below.
-        loaded: dict[str, dict] = {}
-        for sfid in source_file_ids:
-            try:
-                info = await loop.run_in_executor(None, load_tree_status, cluster_snapshot, cluster_name, sfid)
-            except Exception as e:
-                if is_cluster_wide_fatal(e):
-                    raise
-                reason = str(e)
-                push("tree_skipped", {"source_file_id": sfid, "reason": reason})
-                skipped.append({"source_file_id": sfid, "reason": reason})
-                continue
-            if info is not None:
-                loaded[sfid] = info
-
-        # Order is UX-only (biggest wins surface first, the heaviest scans
-        # happen first so a cancel loses the least) -- it never affects the
-        # final allocation, which only runs once every tree is measured.
-        ordered = sorted(loaded, key=lambda sfid: loaded[sfid]["prunable"], reverse=True)
-        total = len(ordered)
-        tree_inputs: list[TreeInput] = []
-
-        for index, sfid in enumerate(ordered):
-            if job.done:
-                break
-            info = loaded[sfid]
-            push(
-                "tree_start",
-                {"source_file_id": sfid, "path": info["path"], "index": index, "total": total},
-            )
-
-            try:
-                # held_reason means an unmeasured pair's older snapshot is
-                # locked/replication-held -- Inspect skips held snapshots by
-                # default, so launching one here can never bring unmeasured
-                # to 0 no matter how many times it's retried. Same reasoning
-                # the warm sweep already uses to give up on these (see
-                # load_tree_status): don't burn a live scan we already know
-                # is doomed, just fall through to the "skipped" branch below.
-                if info["unmeasured"] > 0 and info["held_reason"] is None:
-                    # Trees run strictly one at a time -- this is the one part of
-                    # this feature that does new, potentially heavy live Qumulo
-                    # work, and nothing else in this app runs more than one such
-                    # scan concurrently.
-                    existing = job_registry.find_running(cluster_id, sfid)
-                    if existing is not None:
-                        # Don't drain another consumer's queue -- another tab may
-                        # already be watching this Inspect run.
-                        while not existing.done:
-                            push("inspect_progress", {"source_file_id": sfid, "waiting": True})
-                            await asyncio.sleep(2)
-                            if job.done:
-                                break
-                    else:
-                        async with SessionLocal() as sub_db:
-                            sub_job = await launch_inspect_job(
-                                sub_db,
-                                cluster_id,
-                                cluster_name,
-                                cluster_snapshot,
-                                sfid,
-                                info["path"],
-                                started_by,
-                            )
-                        while True:
-                            if job.done:
-                                # Cancelling the goal run aborts whatever sub-
-                                # inspect is in flight too. Both flags matter:
-                                # .done actually stops run_inspect (should_stop),
-                                # .cancel_requested is what its own finally block
-                                # reads to record "cancelled" instead of
-                                # "completed" in the durable inspect_jobs row.
-                                sub_job.cancel_requested = True
-                                sub_job.done = True
-                            try:
-                                event = await asyncio.wait_for(
-                                    sub_job.event_queue.get(), timeout=1.5
-                                )
-                                # Nested, not spread -- the sub-event has its own
-                                # "type" key (pair_start/progress/finish/...) that
-                                # would otherwise collide with and overwrite this
-                                # wrapper event's own "type": "inspect_progress".
-                                push("inspect_progress", {"source_file_id": sfid, "event": event})
-                                if event.get("type") in ("finish", "error"):
-                                    break
-                            except asyncio.TimeoutError:
-                                pass
-                            if sub_job.done and sub_job.event_queue.empty():
-                                break
-
-                    info = await loop.run_in_executor(None, load_tree_status, cluster_snapshot, cluster_name, sfid)
-            except Exception as e:
-                if is_cluster_wide_fatal(e):
-                    raise
-                reason = str(e)
-                push("tree_skipped", {"source_file_id": sfid, "reason": reason})
-                skipped.append({"source_file_id": sfid, "reason": reason})
-                continue
-
-            if info is None or info["unmeasured"] > 0:
-                held_reason = info.get("held_reason") if info else None
-                if held_reason:
-                    reason = (
-                        f'Contains a {held_reason} snapshot, which Inspect skips by default '
-                        f'since it can\'t actually be deleted. Re-inspect this tree directly '
-                        f'with "Include locked/replication-held snapshots" checked to have it '
-                        f'counted here.'
-                    )
-                else:
-                    reason = "Inspect did not finish measuring every pair -- see the backend log for details."
-                push("tree_skipped", {"source_file_id": sfid, "reason": reason})
-                skipped.append({"source_file_id": sfid, "reason": reason})
-                continue
-
-            push("tree_measured", {"source_file_id": sfid})
-            tree_inputs.append(TreeInput(sfid, info["points"]))
-
+        measured, skipped = await _measure_trees_loop(
+            push, job, cluster_snapshot, cluster_id, cluster_name, source_file_ids, started_by
+        )
+        tree_inputs = [TreeInput(sfid, info["points"]) for sfid, info in measured.items()]
         result = allocate(target_bytes, tree_inputs)
         push("finish", {"result": asdict(result), "skipped": skipped})
     except UnsupportedVersionError as e:
@@ -985,6 +1038,98 @@ async def _run_goal_task(
     except Exception as e:
         error_message = str(e)
         push("error", {"message": error_message})
+    finally:
+        job.done = True
+
+
+class MeasureTreesRequest(BaseModel):
+    source_file_ids: list[str]
+
+
+@router.get("/{cluster_id}/measure-trees/running")
+async def get_running_measure_trees(
+    cluster_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Same reattach purpose as get_running_goal, for the bulk 'measure
+    remaining trees' flow -- a reloaded Dashboard can find this and resume
+    showing live progress instead of losing it until the user clicks the
+    button again."""
+    await get_authorized_cluster(cluster_id, user, db)
+    job = job_registry.find_running(cluster_id, "*", job_type="measure_trees")
+    return {"job_id": job.id if job is not None else None}
+
+
+@router.post("/{cluster_id}/measure-trees", status_code=202)
+async def start_measure_trees(
+    cluster_id: str,
+    req: MeasureTreesRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    cluster = await get_authorized_cluster(cluster_id, user, db)
+    if not req.source_file_ids:
+        raise HTTPException(400, "source_file_ids must not be empty")
+
+    def _get_cluster_name():
+        qclient = make_qclient(cluster)
+        return checked_cluster_name(qclient)
+
+    cluster_name = await _run_qumulo_worker(_get_cluster_name)
+
+    # Ephemeral, in-memory-only job -- same reasoning as the goal solver's job
+    # (see start_goal): spans many trees, doesn't fit inspect_jobs' one-job-
+    # one-tree schema, and nothing expensive is lost on a restart since every
+    # real Inspect run it triggers gets its own durable row via
+    # launch_inspect_job.
+    job = job_registry.create(
+        job_id=str(uuid.uuid4()),
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        source_file_id="*",
+        path="*",
+        started_by=user.id,
+        job_type="measure_trees",
+    )
+
+    cluster_snapshot = {
+        "host": cluster.host,
+        "port": cluster.port,
+        "token_encrypted": cluster.token_encrypted,
+        "insecure": cluster.insecure,
+    }
+    job.task = asyncio.create_task(
+        _run_measure_trees_task(job, cluster_snapshot, cluster_id, cluster_name, req.source_file_ids, user.id)
+    )
+    return {"job_id": job.id}
+
+
+async def _run_measure_trees_task(
+    job: job_registry.InspectJob,
+    cluster_snapshot: dict,
+    cluster_id: str,
+    cluster_name: str,
+    source_file_ids: list[str],
+    started_by: str,
+) -> None:
+    loop = asyncio.get_event_loop()
+
+    def push(event_type: str, data: dict) -> None:
+        loop.call_soon_threadsafe(job.event_queue.put_nowait, {"type": event_type, **data})
+
+    try:
+        measured, skipped = await _measure_trees_loop(
+            push, job, cluster_snapshot, cluster_id, cluster_name, source_file_ids, started_by
+        )
+        push("finish", {"measured": list(measured.keys()), "skipped": skipped})
+    except UnsupportedVersionError as e:
+        push("error", {"message": str(e)})
+    except ApiError as e:
+        message = CLUSTER_AUTH_ERROR_MESSAGE if e.status_code == 401 else str(e)
+        push("error", {"message": message})
+    except Exception as e:
+        push("error", {"message": str(e)})
     finally:
         job.done = True
 

@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, ClusterAuthError, UnsupportedClusterVersionError } from '../api'
 import type { GoalResult, GoalSkippedTree, SnapshotGroup } from '../types'
@@ -40,16 +40,21 @@ interface Props {
   initialSkipped?: GoalSkippedTree[]
   initialHandledIds?: string[]
   initialExcludedIds?: string[]
+  // Set when the Dashboard found an already-running solve on load (see
+  // api.inspect.runningGoal) that this component instance didn't start
+  // itself -- skips straight to the running phase and attaches to that
+  // job's stream instead of starting a new one.
+  reattachJobId?: string
 }
 
 type Phase = 'input' | 'running' | 'results'
 
 export default function GoalModal({
   clusterId, clusterName, groups, onClose, onDeselect,
-  initialResult, initialSkipped, initialHandledIds, initialExcludedIds,
+  initialResult, initialSkipped, initialHandledIds, initialExcludedIds, reattachJobId,
 }: Props) {
   const navigate = useNavigate()
-  const [phase, setPhase] = useState<Phase>(initialResult ? 'results' : 'input')
+  const [phase, setPhase] = useState<Phase>(initialResult ? 'results' : reattachJobId ? 'running' : 'input')
   // When reopened after a "Review & delete" round trip (Dashboard.tsx passes
   // initialResult), this modal never showed the input screen, so amount
   // would otherwise stay '' -- targetBytes() then treats it as 0 and any
@@ -104,6 +109,103 @@ export default function GoalModal({
     return Math.round(n * UNITS[unit])
   }
 
+  // Shared by a fresh solve (runSolve, below) and by reattaching to a solve
+  // this component instance didn't start itself (see the reattachJobId
+  // effect below it) -- both just need to watch an already-created job's
+  // stream the same way. previousSkipped is only meaningful for a "try a
+  // different combination" attempt (see runSolve); reattaching a bare job_id
+  // has none to fall back to, so it passes an empty list.
+  function attachToGoalStream(
+    jobId: string,
+    alternativeExcluded: Set<string> | null,
+    previousSkipped: GoalSkippedTree[],
+  ) {
+    jobIdRef.current = jobId
+    const es = new EventSource(`/api/clusters/${clusterId}/jobs/${jobId}/stream`, { withCredentials: true })
+    esRef.current = es
+
+    es.onmessage = (evt) => {
+      const msg = JSON.parse(evt.data)
+      switch (msg.type) {
+        case 'tree_start':
+          setCurrentTree({ index: msg.index, total: msg.total, path: msg.path })
+          setPairProgress(null)
+          setSubProgress(null)
+          setStatusMsg(`Checking tree ${msg.index + 1} of ${msg.total}…`)
+          break
+        case 'tree_measured':
+          setStatusMsg('Already measured — moving on…')
+          break
+        case 'tree_skipped':
+          setSkipped(prev => [...prev, { source_file_id: msg.source_file_id, reason: msg.reason }])
+          break
+        case 'inspect_progress':
+          // waiting and a nested event aren't mutually exclusive: this
+          // tree's Inspect run may already be running elsewhere (another
+          // tab, or the background warm sweep), in which case msg.event
+          // carries that run's most recently observed progress even while
+          // we're just polling for it.
+          if (msg.waiting) {
+            setStatusMsg('Waiting for an in-progress Inspect run on this tree (started elsewhere)…')
+          }
+          if (msg.event?.type === 'pair_start') {
+            if (!msg.waiting) setStatusMsg(`Inspecting — measuring ${msg.event.total} pairs…`)
+            // index/total are the pair's position among *all* pairs in this
+            // tree (including already-cached ones from a prior run), so
+            // this stays accurate even when resuming a partially-measured
+            // tree -- unlike the candidate-file count below, the total here
+            // never changes mid-run.
+            setPairProgress({ current: msg.event.index, total: msg.event.total })
+            setSubProgress({ found: 0, sized: 0 })
+          } else if (msg.event?.type === 'progress') {
+            setSubProgress({ found: msg.event.found, sized: msg.event.sized })
+          } else if (msg.event?.type === 'pair_finished') {
+            setPairProgress(prev => prev ? { ...prev, current: msg.event.index } : prev)
+          }
+          break
+        case 'finish':
+          es.close()
+          if (alternativeExcluded !== null && !msg.result.goal_met) {
+            // This alternative doesn't reach the goal -- keep showing the
+            // last successful plan (result/skipped untouched) and stop
+            // offering further alternatives rather than replacing a working
+            // plan with a worse, incomplete one.
+            setSkipped(previousSkipped)
+            setNoMoreAlternatives(true)
+            setPhase('results')
+            break
+          }
+          setResult(msg.result)
+          if (alternativeExcluded !== null) setExcludedIds(alternativeExcluded)
+          setPhase('results')
+          break
+        case 'error':
+          es.close()
+          setPhase(alternativeExcluded !== null ? 'results' : 'input')
+          setError(msg.message)
+          break
+      }
+    }
+    es.onerror = () => {
+      es.close()
+      setPhase(alternativeExcluded !== null ? 'results' : 'input')
+      setError('Stream disconnected.')
+    }
+  }
+
+  // A page reload (or leaving and coming back) loses all of the above state,
+  // but the solve keeps running server-side -- without this, the user would
+  // see no progress at all until they re-solved from scratch. Dashboard.tsx
+  // discovers the job via api.inspect.runningGoal and mounts this component
+  // with reattachJobId set instead of showing the input screen.
+  useEffect(() => {
+    if (reattachJobId) {
+      setStatusMsg('Reattached to an in-progress solve…')
+      attachToGoalStream(reattachJobId, null, [])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // alternativeExcluded === null means this is a fresh solve from the input
   // screen (resets everything). Non-null means this is a "try a different
   // combination" attempt: the previous successful result/skipped/excludedIds
@@ -133,71 +235,7 @@ export default function GoalModal({
 
     try {
       const { job_id } = await api.inspect.startGoal(clusterId, sourceFileIds, bytes)
-      jobIdRef.current = job_id
-      const es = new EventSource(`/api/clusters/${clusterId}/jobs/${job_id}/stream`, { withCredentials: true })
-      esRef.current = es
-
-      es.onmessage = (evt) => {
-        const msg = JSON.parse(evt.data)
-        switch (msg.type) {
-          case 'tree_start':
-            setCurrentTree({ index: msg.index, total: msg.total, path: msg.path })
-            setPairProgress(null)
-            setSubProgress(null)
-            setStatusMsg(`Checking tree ${msg.index + 1} of ${msg.total}…`)
-            break
-          case 'tree_measured':
-            setStatusMsg('Already measured — moving on…')
-            break
-          case 'tree_skipped':
-            setSkipped(prev => [...prev, { source_file_id: msg.source_file_id, reason: msg.reason }])
-            break
-          case 'inspect_progress':
-            if (msg.waiting) {
-              setStatusMsg('Waiting for an in-progress Inspect run on this tree…')
-            } else if (msg.event?.type === 'pair_start') {
-              setStatusMsg(`Inspecting — measuring ${msg.event.total} pairs…`)
-              // index/total are the pair's position among *all* pairs in this
-              // tree (including already-cached ones from a prior run), so
-              // this stays accurate even when resuming a partially-measured
-              // tree -- unlike the candidate-file count below, the total here
-              // never changes mid-run.
-              setPairProgress({ current: msg.event.index, total: msg.event.total })
-              setSubProgress({ found: 0, sized: 0 })
-            } else if (msg.event?.type === 'progress') {
-              setSubProgress({ found: msg.event.found, sized: msg.event.sized })
-            } else if (msg.event?.type === 'pair_finished') {
-              setPairProgress(prev => prev ? { ...prev, current: msg.event.index } : prev)
-            }
-            break
-          case 'finish':
-            es.close()
-            if (alternativeExcluded !== null && !msg.result.goal_met) {
-              // This alternative doesn't reach the goal -- keep showing the
-              // last successful plan (result/skipped untouched) and stop
-              // offering further alternatives rather than replacing a working
-              // plan with a worse, incomplete one.
-              setSkipped(previousSkipped)
-              setNoMoreAlternatives(true)
-              setPhase('results')
-              break
-            }
-            setResult(msg.result)
-            if (alternativeExcluded !== null) setExcludedIds(alternativeExcluded)
-            setPhase('results')
-            break
-          case 'error':
-            es.close()
-            setPhase(alternativeExcluded !== null ? 'results' : 'input')
-            setError(msg.message)
-            break
-        }
-      }
-      es.onerror = () => {
-        es.close()
-        setPhase(alternativeExcluded !== null ? 'results' : 'input')
-        setError('Stream disconnected.')
-      }
+      attachToGoalStream(job_id, alternativeExcluded, previousSkipped)
     } catch (err: unknown) {
       setPhase(alternativeExcluded !== null ? 'results' : 'input')
       if (err instanceof ClusterAuthError) setError(err.message)

@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { api, ClusterAuthError, UnsupportedClusterVersionError } from '../api'
 import type { CurvePoint, GoalReturnState, LastRun, ReclaimRow, SnapshotGroup, SnapshotSizeRow } from '../types'
 import { useAuth } from '../App'
+import { downloadCsv, toCsv } from '../csv'
 
 function fmtBytes(n: number | null): string {
   if (n === null || n === 0) return '—'
@@ -133,6 +134,8 @@ export default function InspectDetail() {
   const sizeJobIdRef = useRef<string | null>(null)
   const sizeCancelRequestedRef = useRef(false)
   const chainToSizeRef = useRef(false)
+  const exportAfterInspectRef = useRef(false)
+  const [showExportWarning, setShowExportWarning] = useState(false)
 
   const [sizeFilterMode, setSizeFilterMode] = useState<'days' | 'date'>('days')
   const [sizeFilterDays, setSizeFilterDays] = useState('')
@@ -243,6 +246,10 @@ export default function InspectDetail() {
                   chainToSizeRef.current = false
                   startSizeSnapshots()
                 }
+                if (exportAfterInspectRef.current) {
+                  exportAfterInspectRef.current = false
+                  exportCurveCsv(r.points)
+                }
               })
             break
           case 'error':
@@ -250,6 +257,7 @@ export default function InspectDetail() {
             setRunning(false)
             setStatusMsg(`Error: ${msg.message}`)
             chainToSizeRef.current = false
+            exportAfterInspectRef.current = false
             break
           case 'no_curve':
             es.close()
@@ -259,6 +267,10 @@ export default function InspectDetail() {
               chainToSizeRef.current = false
               startSizeSnapshots()
             }
+            if (exportAfterInspectRef.current) {
+              exportAfterInspectRef.current = false
+              exportCurveCsv()
+            }
             break
         }
       }
@@ -267,10 +279,12 @@ export default function InspectDetail() {
         setRunning(false)
         setStatusMsg('Stream disconnected.')
         chainToSizeRef.current = false
+        exportAfterInspectRef.current = false
       }
     } catch (err: unknown) {
       setRunning(false)
       chainToSizeRef.current = false
+      exportAfterInspectRef.current = false
       if (err instanceof ClusterAuthError) setClusterAuthExpired(true)
       if (err instanceof UnsupportedClusterVersionError) setUnsupportedVersionMessage(err.message)
       setStatusMsg(err instanceof Error ? err.message : 'Failed to start')
@@ -280,6 +294,29 @@ export default function InspectDetail() {
   function startRefreshAll() {
     chainToSizeRef.current = true
     startInspect()
+  }
+
+  function exportCurveCsv(pts: CurvePoint[] = points) {
+    const csv = toCsv(
+      ['older_snapshot_id', 'older_snapshot_name', 'older_date', 'older_age_days', 'newer_snapshot_id', 'newer_date', 'newer_age_days', 'freed_bytes', 'cumulative_bytes', 'total_files', 'status'],
+      pts.map(p => [
+        p.older_id, p.older_name, p.older_date, p.older_age_days,
+        p.newer_id, p.newer_date, p.newer_age_days,
+        p.freed_bytes, p.cumulative_bytes, p.total_files, p.status,
+      ])
+    )
+    const namePart = (group?.path || sourceFileId || 'tree').replace(/[^a-zA-Z0-9._-]+/g, '_')
+    downloadCsv(`reclaim-curve-${namePart}-${new Date().toISOString().slice(0, 10)}.csv`, csv)
+  }
+
+  function measureAndExport() {
+    exportAfterInspectRef.current = true
+    startInspect()
+  }
+
+  function handleExportClick() {
+    if (unmeasured > 0) setShowExportWarning(true)
+    else exportCurveCsv()
   }
 
   function stopInspect() {
@@ -838,6 +875,50 @@ export default function InspectDetail() {
           {sizeRunSummary.skipped > 0 && sizeRunSummary.errored > 0 && ' · '}
           {sizeRunSummary.errored > 0 && `${sizeRunSummary.errored} snapshot${sizeRunSummary.errored > 1 ? 's' : ''} failed (see backend log)`}
         </p>
+      )}
+
+      {/* Reclaim curve export */}
+      {points.length > 0 && (
+        <div className="mb-4 rounded-lg border border-blackberry-700 bg-blackberry-900 px-4 py-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-lychee-100">Reclaim curve data</p>
+              <p className="text-xs text-lychee-500">Export the raw per-pair curve as CSV to build your own charts.</p>
+            </div>
+            <button
+              onClick={handleExportClick}
+              disabled={running || sizeRunning}
+              className="rounded-md border border-agave-500 px-3 py-1.5 text-xs text-agave-400 hover:bg-blackberry-850 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Export CSV
+            </button>
+          </div>
+          {showExportWarning && (
+            <div className="mt-3 flex items-center justify-between rounded-md border border-kumquat-700 bg-kumquat-700/20 px-3 py-2 text-xs text-kumquat-400">
+              <span>{unmeasured} pair{unmeasured > 1 ? 's' : ''} not yet measured — this export will be missing those rows.</span>
+              <div className="flex flex-shrink-0 gap-2">
+                <button
+                  onClick={() => setShowExportWarning(false)}
+                  className="rounded-md px-2 py-1 text-lychee-300 hover:bg-blackberry-850"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => { setShowExportWarning(false); exportCurveCsv() }}
+                  className="rounded-md px-2 py-1 text-lychee-300 hover:bg-blackberry-850"
+                >
+                  Export anyway
+                </button>
+                <button
+                  onClick={() => { setShowExportWarning(false); measureAndExport() }}
+                  className="rounded-md bg-agave-500 px-2 py-1 text-blackberry-950 hover:bg-agave-600"
+                >
+                  Measure & export
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       )}
 
       {/* Reclaim curve table */}

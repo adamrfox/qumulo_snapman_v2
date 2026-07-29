@@ -14,13 +14,15 @@ this module holds nothing that needs to survive a restart on its own, so
 import asyncio
 import sys
 
+from datetime import datetime
+
 from sqlalchemy import select
 
 from app.config import settings
 from app.database import SessionLocal
 from app.jobs import InspectJob as JobHandle
 from app.jobs import find_running
-from app.models import Cluster, WarmTree
+from app.models import Cluster, InspectJob, WarmTree
 from app.routers.inspect import (
     checked_cluster_name,
     is_cluster_wide_fatal,
@@ -100,6 +102,19 @@ async def _cluster_sweep_loop(cluster_id: str) -> None:
             pass
 
 
+async def _record_sweep_result(warm_tree_id: str, error: str | None) -> None:
+    """Persists the outcome of one sweep attempt onto its WarmTree row so the
+    warm-trees list endpoint can show the user whether keep-warm is actually
+    working for a tree, not just that it's opted in."""
+    async with SessionLocal() as db:
+        row = await db.get(WarmTree, warm_tree_id)
+        if row is None:
+            return  # opted out or cluster deleted mid-sweep
+        row.last_swept_at = datetime.utcnow()
+        row.last_error = error
+        await db.commit()
+
+
 async def _sweep_cluster_once(cluster_id: str, warm_trees: list[WarmTree]) -> None:
     loop = asyncio.get_event_loop()
 
@@ -154,6 +169,7 @@ async def _sweep_cluster_once(cluster_id: str, warm_trees: list[WarmTree]) -> No
                 f"[snapman] warm sweep: tree {sfid} on cluster {cluster_id} failed ({e}) -- skipping",
                 file=sys.stderr,
             )
+            await _record_sweep_result(warm_tree.id, str(e))
             continue
 
         if info is None:
@@ -172,6 +188,7 @@ async def _sweep_cluster_once(cluster_id: str, warm_trees: list[WarmTree]) -> No
             continue
 
         if info["unmeasured"] == 0:
+            await _record_sweep_result(warm_tree.id, None)
             continue
 
         async with SessionLocal() as db:
@@ -180,12 +197,23 @@ async def _sweep_cluster_once(cluster_id: str, warm_trees: list[WarmTree]) -> No
                 sfid, info["path"], warm_tree.created_by,
             )
         _active_jobs[job.id] = job
+        sweep_error: str | None = None
         try:
             await job.task
         except Exception as e:
+            # _run_inspect_task normally swallows its own failures into the
+            # durable InspectJob row below rather than raising -- this is
+            # only a safety net for a truly unexpected crash of the task itself.
+            sweep_error = str(e)
             print(
                 f"[snapman] warm sweep: inspect of {sfid} on cluster {cluster_id} raised ({e})",
                 file=sys.stderr,
             )
         finally:
             _active_jobs.pop(job.id, None)
+        if sweep_error is None:
+            async with SessionLocal() as db:
+                db_job = await db.get(InspectJob, job.id)
+                if db_job is not None and db_job.status == "error":
+                    sweep_error = db_job.error_message
+        await _record_sweep_result(warm_tree.id, sweep_error)

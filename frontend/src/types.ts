@@ -41,10 +41,12 @@ export interface ReclaimRow {
 
 export interface CurvePoint {
   older_id: number
-  older_date: string
   older_name: string
+  older_age_days: number
+  older_date: string
   newer_id: number
   newer_date: string
+  newer_age_days: number
   freed_bytes: number | null
   cumulative_bytes: number | null
   total_files: number | null
@@ -67,6 +69,12 @@ export interface LastRun {
   status: string
   error_message: string | null
   finished_at: string | null
+}
+
+export interface WarmTreeStatus {
+  source_file_id: string
+  last_swept_at: string | null
+  last_error: string | null
 }
 
 export interface TreeAllocation {

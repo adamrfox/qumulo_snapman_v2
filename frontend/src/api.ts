@@ -130,8 +130,16 @@ export const api = {
       request<{ job_id: string }>(
         'POST', `/api/clusters/${clusterId}/goal`, { source_file_ids: sourceFileIds, target_bytes: targetBytes }
       ),
+    measureTrees: (clusterId: string, sourceFileIds: string[]) =>
+      request<{ job_id: string }>(
+        'POST', `/api/clusters/${clusterId}/measure-trees`, { source_file_ids: sourceFileIds }
+      ),
+    runningMeasureTrees: (clusterId: string) =>
+      request<{ job_id: string | null }>('GET', `/api/clusters/${clusterId}/measure-trees/running`),
+    runningGoal: (clusterId: string) =>
+      request<{ job_id: string | null }>('GET', `/api/clusters/${clusterId}/goal/running`),
     warmTrees: (clusterId: string) =>
-      request<{ source_file_ids: string[] }>('GET', `/api/clusters/${clusterId}/warm-trees`),
+      request<{ warm_trees: import('./types').WarmTreeStatus[] }>('GET', `/api/clusters/${clusterId}/warm-trees`),
     addWarmTree: (clusterId: string, sourceFileId: string) =>
       request<{ ok: boolean }>('PUT', `/api/clusters/${clusterId}/warm-trees/${sourceFileId}`),
     removeWarmTree: (clusterId: string, sourceFileId: string) =>
