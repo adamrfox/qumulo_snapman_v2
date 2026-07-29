@@ -146,6 +146,12 @@ backend` in that case).
   - **Keep warm** — opt this tree into continuous background re-Inspection (see
     Architecture below), so its reclaim curve is already fresh next time anyone
     looks at it or includes it in a goal, instead of waiting on an on-demand scan.
+    Once opted in, a status dot next to the checkbox shows what the sweep is
+    actually doing: gray before its first pass, a pulsing dot while a sweep is
+    currently running (hover for live pair/file progress), green after a
+    successful pass, red if the last attempt failed, or amber if the tree's
+    remaining history is permanently capped by a locked/replication-owned
+    snapshot. Hover any state for the full detail and timestamp.
   - **Refresh** (top right) — bypass the 5-minute snapshot-listing cache and re-fetch
     from the cluster right now.
 
@@ -198,8 +204,13 @@ that has at least one opted-in tree — still no Redis/queue, just a longer-live
 instead of a one-shot job, spawned and retired by a lightweight supervisor as opt-ins
 come and go. The opt-in list (`warm_trees` table) is the only state that needs to
 survive a restart; the sweep just picks back up from it. A tree that's already fully
-measured, permanently blocked by a held snapshot, or currently being Inspected by
-someone else is skipped rather than rescanned every pass.
+measured, has nothing left it could measure (every remaining pair blocked by a
+locked/replication-held snapshot), or is currently being Inspected by someone else is
+skipped rather than rescanned every pass — but a tree with only *some* pairs blocked
+is still swept for the rest of its curve, since Inspect measures everything it can and
+skips just the held pairs on its own. Each pass records its outcome back onto the
+`warm_trees` row (last swept time, error, or held status) so it can be surfaced as the
+Dashboard's status dot instead of opting in being fire-and-forget.
 
 **Backend stack**: FastAPI, SQLAlchemy (async) + asyncpg, Alembic migrations, PyJWT,
 `cryptography` (Fernet, for encrypting stored Qumulo tokens), httpx.
