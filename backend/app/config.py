@@ -28,11 +28,12 @@ class Settings:
     pair_batch_size: int = int(os.environ.get("PAIR_BATCH_SIZE", "50"))
     api_timeout: float = float(os.environ.get("API_TIMEOUT", "300.0"))
 
-    # Warm-tree background sweep (see app/warm_sweep.py): how often an
-    # already-running per-cluster sweep loop re-checks its opted-in trees,
-    # and how often the supervisor checks for clusters that gained/lost
-    # their last opted-in tree.
-    warm_sweep_interval_seconds: float = float(os.environ.get("WARM_SWEEP_INTERVAL_SECONDS", "900"))
+    # Warm-tree background sweep (see app/warm_sweep.py): how often the
+    # supervisor checks for clusters that gained/lost their last opted-in
+    # tree. (How often an already-running per-cluster loop re-checks its
+    # opted-in trees is admin-configurable at runtime -- see
+    # AppSettings.warm_sweep_interval_minutes / routers/admin_settings.py --
+    # rather than fixed at deploy time like this one.)
     warm_sweep_poll_interval_seconds: float = float(
         os.environ.get("WARM_SWEEP_POLL_INTERVAL_SECONDS", "60")
     )

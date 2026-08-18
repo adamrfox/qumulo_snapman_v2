@@ -23,6 +23,7 @@ from app.database import SessionLocal
 from app.jobs import InspectJob as JobHandle
 from app.jobs import find_running
 from app.models import Cluster, InspectJob, WarmTree
+from app.routers.admin_settings import get_settings as get_app_settings
 from app.routers.inspect import (
     checked_cluster_name,
     is_cluster_wide_fatal,
@@ -96,10 +97,19 @@ async def _cluster_sweep_loop(cluster_id: str) -> None:
 
         try:
             await asyncio.wait_for(
-                _shutdown.wait(), timeout=settings.warm_sweep_interval_seconds
+                _shutdown.wait(), timeout=await _sweep_interval_seconds()
             )
         except asyncio.TimeoutError:
             pass
+
+
+async def _sweep_interval_seconds() -> float:
+    """Re-read on every pass (rather than cached at process start) so an
+    admin's change to Settings > Keep-warm interval takes effect on this
+    cluster's very next sleep instead of requiring a backend restart."""
+    async with SessionLocal() as db:
+        app_settings = await get_app_settings(db)
+    return app_settings.warm_sweep_interval_minutes * 60
 
 
 # Sentinel distinguishing "leave held_reason as whatever it already was"

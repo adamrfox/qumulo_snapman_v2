@@ -22,15 +22,17 @@ export default function Admin() {
 
   const [lifetimeDays, setLifetimeDays] = useState('365')
   const [neverExpire, setNeverExpire] = useState(false)
+  const [warmSweepMinutes, setWarmSweepMinutes] = useState('15')
   const [savingSettings, setSavingSettings] = useState(false)
   const [settingsError, setSettingsError] = useState('')
   const [settingsSaved, setSettingsSaved] = useState(false)
 
   useEffect(() => {
     api.users.list().then(setUsers).catch(() => {})
-    api.admin.getSettings().then(({ access_token_lifetime_days }) => {
+    api.admin.getSettings().then(({ access_token_lifetime_days, warm_sweep_interval_minutes }) => {
       setNeverExpire(access_token_lifetime_days === null)
       if (access_token_lifetime_days !== null) setLifetimeDays(String(access_token_lifetime_days))
+      setWarmSweepMinutes(String(warm_sweep_interval_minutes))
     }).catch(() => {})
   }, [])
 
@@ -43,9 +45,14 @@ export default function Admin() {
       setSettingsError('Enter a positive number of days, or check "Never expire"')
       return
     }
+    const sweepMinutes = Number(warmSweepMinutes)
+    if (!Number.isFinite(sweepMinutes) || sweepMinutes < 1) {
+      setSettingsError('Enter a keep-warm sweep interval of at least 1 minute')
+      return
+    }
     setSavingSettings(true)
     try {
-      await api.admin.updateSettings(days)
+      await api.admin.updateSettings(days, sweepMinutes)
       setSettingsSaved(true)
     } catch (err: unknown) {
       setSettingsError(err instanceof Error ? err.message : 'Failed to save')
@@ -211,44 +218,74 @@ export default function Admin() {
       </div>
 
       <div className="mt-8">
-        <h2 className="mb-1 text-lg font-light text-lychee-100">Cluster authentication</h2>
-        <p className="mb-3 text-sm text-lychee-400">
-          When a cluster is registered with a username and password, snapman exchanges that login
-          for a Qumulo access token and stores that instead of the raw session token -- session
-          tokens expire on a fixed schedule outside this app's control, which silently breaks
-          keep-warm and any other background use once they do. This controls how long those
-          derived access tokens live. Only affects clusters added or updated with username/password
-          after this is changed; a cluster registered by pasting a bearer token directly is
-          unaffected.
-        </p>
-        <form onSubmit={saveSettings} className="flex flex-wrap items-center gap-3">
-          <input
-            type="number"
-            min={1}
-            step="1"
-            value={lifetimeDays}
-            onChange={e => setLifetimeDays(e.target.value)}
-            disabled={neverExpire}
-            className="w-24 rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500 disabled:opacity-40"
-          />
-          <span className="text-sm text-lychee-400">days</span>
-          <label className="flex items-center gap-2 text-sm text-lychee-400">
-            <input
-              type="checkbox"
-              checked={neverExpire}
-              onChange={e => setNeverExpire(e.target.checked)}
-            />
-            Never expire
-          </label>
-          <button
-            type="submit"
-            disabled={savingSettings}
-            className="rounded-md border border-blackberry-700 px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
-          >
-            {savingSettings ? 'Saving…' : 'Save'}
-          </button>
-          {settingsSaved && <span className="text-sm text-kiwi-400">Saved</span>}
-          {settingsError && <span className="text-sm text-pomegranate-400">{settingsError}</span>}
+        <h2 className="mb-3 text-lg font-light text-lychee-100">App settings</h2>
+        <form onSubmit={saveSettings} className="space-y-5">
+          <div>
+            <h3 className="mb-1 text-sm font-medium text-lychee-200">Cluster authentication</h3>
+            <p className="mb-3 text-sm text-lychee-400">
+              When a cluster is registered with a username and password, snapman exchanges that
+              login for a Qumulo access token and stores that instead of the raw session token --
+              session tokens expire on a fixed schedule outside this app's control, which silently
+              breaks keep-warm and any other background use once they do. This controls how long
+              those derived access tokens live. Only affects clusters added or updated with
+              username/password after this is changed; a cluster registered by pasting a bearer
+              token directly is unaffected.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                type="number"
+                min={1}
+                step="1"
+                value={lifetimeDays}
+                onChange={e => setLifetimeDays(e.target.value)}
+                disabled={neverExpire}
+                className="w-24 rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500 disabled:opacity-40"
+              />
+              <span className="text-sm text-lychee-400">days</span>
+              <label className="flex items-center gap-2 text-sm text-lychee-400">
+                <input
+                  type="checkbox"
+                  checked={neverExpire}
+                  onChange={e => setNeverExpire(e.target.checked)}
+                />
+                Never expire
+              </label>
+            </div>
+          </div>
+
+          <div>
+            <h3 className="mb-1 text-sm font-medium text-lychee-200">Keep-warm sweep interval</h3>
+            <p className="mb-3 text-sm text-lychee-400">
+              How often the background sweep re-checks each opted-in tree for new snapshots to
+              measure (see the status dot on the Dashboard's Keep warm column). Applies to every
+              cluster, not per tree -- a pass that finds nothing new is already cheap, so there's
+              little to gain from tuning it per tree. Takes effect on each cluster's next sweep
+              without a restart.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                type="number"
+                min={1}
+                step="1"
+                value={warmSweepMinutes}
+                onChange={e => setWarmSweepMinutes(e.target.value)}
+                className="w-24 rounded-md border border-blackberry-700 bg-blackberry-800 px-3 py-1.5 text-sm text-lychee-300 focus:outline-none focus:ring-2 focus:ring-agave-500/30 focus:border-agave-500"
+              />
+              <span className="text-sm text-lychee-400">minutes</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button
+              type="submit"
+              disabled={savingSettings}
+              className="rounded-md border border-blackberry-700 px-4 py-1.5 text-sm text-lychee-300 hover:bg-blackberry-850 disabled:opacity-40"
+            >
+              {savingSettings ? 'Saving…' : 'Save'}
+            </button>
+            {settingsSaved && <span className="text-sm text-kiwi-400">Saved</span>}
+            {settingsError && <span className="text-sm text-pomegranate-400">{settingsError}</span>}
+          </div>
         </form>
       </div>
 

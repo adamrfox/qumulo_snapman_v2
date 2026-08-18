@@ -181,8 +181,11 @@ console output into one file for troubleshooting. **Cluster authentication** set
 long an access token derived from a username/password login lives before it needs to
 be re-issued (default 365 days; can be set to never expire) — only affects clusters
 added or updated with username/password after the setting changes, not ones
-registered by pasting a bearer token directly. Any user can change their own password
-(Layout header) with current-password verification.
+registered by pasting a bearer token directly. **Keep-warm sweep interval** sets how
+often the background sweep re-checks opted-in trees (default 15 minutes, applies
+cluster-wide rather than per tree) and takes effect on each cluster's next sweep
+without a restart. Any user can change their own password (Layout header) with
+current-password verification.
 
 ## Architecture
 
@@ -199,7 +202,9 @@ a thread-pool executor for the sync Qumulo API calls, tracked in an in-process j
 registry (`app/jobs.py`) and streamed to the browser over Server-Sent Events.
 
 A second, independent path runs *unprompted*: **Keep warm** trees (`app/warm_sweep.py`)
-are re-Inspected on a fixed interval by one long-lived supervised task per cluster
+are re-Inspected on an admin-configurable interval (Admin > App settings, default 15
+minutes; applies to every cluster, not per tree — see the design note in
+`app/routers/admin_settings.py`) by one long-lived supervised task per cluster
 that has at least one opted-in tree — still no Redis/queue, just a longer-lived task
 instead of a one-shot job, spawned and retired by a lightweight supervisor as opt-ins
 come and go. The opt-in list (`warm_trees` table) is the only state that needs to

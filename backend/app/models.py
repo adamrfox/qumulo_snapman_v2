@@ -118,3 +118,7 @@ class AppSettings(Base):
     # Lifetime of the Qumulo access tokens this app derives from a
     # username+password login (see clusters.py). None means "never expires".
     access_token_lifetime_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # How often the keep-warm background sweep (app/warm_sweep.py) re-checks
+    # each opted-in tree for new unmeasured pairs. Applies cluster-wide, not
+    # per-tree -- see the design note in routers/admin_settings.py.
+    warm_sweep_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False)

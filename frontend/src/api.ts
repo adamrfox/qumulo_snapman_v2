@@ -61,10 +61,15 @@ export const api = {
         'GET', `/api/admin/logs?lines=${lines}`
       ),
     getSettings: () =>
-      request<{ access_token_lifetime_days: number | null }>('GET', '/api/admin/settings'),
-    updateSettings: (accessTokenLifetimeDays: number | null) =>
-      request<{ access_token_lifetime_days: number | null }>(
-        'PATCH', '/api/admin/settings', { access_token_lifetime_days: accessTokenLifetimeDays }
+      request<{ access_token_lifetime_days: number | null; warm_sweep_interval_minutes: number }>(
+        'GET', '/api/admin/settings'
+      ),
+    updateSettings: (accessTokenLifetimeDays: number | null, warmSweepIntervalMinutes: number) =>
+      request<{ access_token_lifetime_days: number | null; warm_sweep_interval_minutes: number }>(
+        'PATCH', '/api/admin/settings', {
+          access_token_lifetime_days: accessTokenLifetimeDays,
+          warm_sweep_interval_minutes: warmSweepIntervalMinutes,
+        }
       ),
   },
   clusters: {
