@@ -49,7 +49,7 @@ export default function Layout() {
         <div className="flex items-center gap-4 text-sm">
           {user?.role === 'admin' && (
             <Link to="/admin" className="text-lychee-300 hover:text-lychee-100">
-              Admin
+              Administration
             </Link>
           )}
           <span className="text-lychee-400">
