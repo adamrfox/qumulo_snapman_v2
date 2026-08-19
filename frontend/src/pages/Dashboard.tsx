@@ -667,12 +667,12 @@ export default function Dashboard() {
                           title="Select all"
                         />
                       </th>
-                      <th className="px-4 py-3">Path</th>
-                      <th className="px-4 py-3 text-right">Snaps</th>
-                      <th className="px-4 py-3 text-right">Oldest</th>
-                      <th className="px-4 py-3 text-right">Prunable</th>
-                      <th className="px-4 py-3 text-right">Measured</th>
-                      <th className="px-4 py-3 text-right">Reclaim~</th>
+                      <th className="px-4 py-3" title="The directory on the cluster this row's snapshot history covers.">Path</th>
+                      <th className="px-4 py-3 text-right" title="Total number of snapshots currently on the cluster for this tree.">Snaps</th>
+                      <th className="px-4 py-3 text-right" title="Age in days of this tree's oldest snapshot.">Oldest</th>
+                      <th className="px-4 py-3 text-right" title="Adjacent snapshot pairs older than the cutoff above, walked from the oldest snapshot forward until a locked/replication-owned one is hit — these are the pairs a deletion could actually reclaim.">Prunable</th>
+                      <th className="px-4 py-3 text-right" title="Of the Prunable pairs, the percentage snapman has actually computed a reclaim size for (via Inspect, Keep warm, or the goal solver). An unmeasured pair contributes nothing to Reclaim~ yet, even if it holds real space.">Measured</th>
+                      <th className="px-4 py-3 text-right" title="Estimated bytes freed by deleting the prunable, measured snapshots, walked oldest to newest. Stops accumulating at the first unmeasured or held pair, so a partially-measured tree's total can understate what's really reclaimable — re-check after measuring more. A ≤ prefix means this tree overlaps a parent/child snapshotted path, so some of this space may be shared rather than uniquely freed.">Reclaim~</th>
                       <th className="px-4 py-3 text-center" title="Automatically keep this tree's reclaim curve refreshed in the background, even when nobody has the app open">Keep warm</th>
                     </tr>
                   </thead>
