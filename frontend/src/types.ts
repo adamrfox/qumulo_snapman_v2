@@ -85,6 +85,10 @@ export interface WarmTreeStatus {
   held_reason: string | null
   running: boolean
   progress: WarmTreeProgress | null
+  // Null means "couldn't be determined right now" (e.g. cluster unreachable),
+  // not "zero" -- see warmStatusInfo in Dashboard.tsx.
+  unmeasured: number | null
+  unmeasured_computable: number | null
 }
 
 export interface TreeAllocation {

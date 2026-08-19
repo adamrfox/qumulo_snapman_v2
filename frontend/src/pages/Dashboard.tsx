@@ -7,6 +7,10 @@ import { downloadCsv, toCsv } from '../csv'
 
 function warmStatusInfo(status: WarmTreeStatus | undefined): { color: string; animate: boolean; text: string } {
   if (!status) return { color: '', animate: false, text: '' }
+  const backlog = status.unmeasured_computable
+  const backlogNote = backlog !== null && backlog > 0
+    ? ` — ${backlog} pair${backlog === 1 ? '' : 's'} still waiting to be sized`
+    : ''
   if (status.running) {
     const p = status.progress
     const detail = p && p.pair_index !== null && p.pair_total !== null
@@ -29,13 +33,29 @@ function warmStatusInfo(status: WarmTreeStatus | undefined): { color: string; an
     }
   }
   if (status.last_swept_at) {
+    // A completed sweep can still leave pairs unmeasured -- new snapshots
+    // landed mid-sweep, a pair errored/timed out and will retry next pass,
+    // or this tree's queue position just hasn't come up again yet. Flag
+    // that distinctly from "fully caught up" rather than showing plain
+    // green either way.
+    if (backlog !== null && backlog > 0) {
+      return {
+        color: 'bg-kumquat-300',
+        animate: false,
+        text: `Last swept ${new Date(status.last_swept_at).toLocaleString()}${backlogNote} — will continue on the next sweep`,
+      }
+    }
     return {
       color: 'bg-kiwi-400',
       animate: false,
       text: `Last kept warm ${new Date(status.last_swept_at).toLocaleString()}`,
     }
   }
-  return { color: 'bg-lychee-500', animate: false, text: 'Opted in — waiting for the first background sweep' }
+  return {
+    color: 'bg-lychee-500',
+    animate: false,
+    text: `Opted in — waiting for the first background sweep${backlogNote}`,
+  }
 }
 
 function fmtBytes(n: number): string {
@@ -188,7 +208,7 @@ export default function Dashboard() {
       setWarmTrees(prev => {
         const next = new Map(prev)
         if (isWarm) next.delete(sourceFileId)
-        else next.set(sourceFileId, { source_file_id: sourceFileId, last_swept_at: null, last_error: null, held_reason: null, running: false, progress: null })
+        else next.set(sourceFileId, { source_file_id: sourceFileId, last_swept_at: null, last_error: null, held_reason: null, running: false, progress: null, unmeasured: null, unmeasured_computable: null })
         return next
       })
     } catch (e: unknown) {
@@ -304,6 +324,17 @@ export default function Dashboard() {
   // total_pairs > 0 excludes single-snapshot trees -- there's nothing to
   // measure there, so they shouldn't count as "incomplete."
   const incompleteGroups = groups.filter(g => g.total_pairs > 0 && g.measured_pairs < g.total_pairs)
+
+  // Keep-warm backlog: opted-in trees the background sweep hasn't fully
+  // caught up on yet (unmeasured_computable excludes pairs permanently
+  // blocked by a held snapshot -- those will never clear via keep-warm no
+  // matter how far behind the sweep is, so they don't count as "backlog").
+  // unmeasured_computable is null when the last /warm-trees fetch couldn't
+  // reach the cluster to check -- those are left out of the count rather
+  // than silently treated as caught up.
+  const warmBacklogTrees = Array.from(warmTrees.values()).filter(s => (s.unmeasured_computable ?? 0) > 0)
+  const warmBacklogPairs = warmBacklogTrees.reduce((sum, s) => sum + (s.unmeasured_computable ?? 0), 0)
+  const warmUnknownTrees = Array.from(warmTrees.values()).filter(s => s.unmeasured_computable === null).length
 
   function exportFleetCsv(gs: SnapshotGroup[] = groups) {
     const sorted = [...gs].sort((a, b) => b.reclaim_bytes - a.reclaim_bytes)
@@ -589,6 +620,22 @@ export default function Dashboard() {
               </div>
             ) : (
               error && <p className="text-sm text-pomegranate-400">{error}</p>
+            )}
+
+            {!loadingGroups && warmTrees.size > 0 && (
+              <div
+                className={`mb-4 rounded-md border px-4 py-2 text-xs ${
+                  warmBacklogTrees.length > 0
+                    ? 'border-kumquat-700 bg-kumquat-700/20 text-kumquat-400'
+                    : 'border-blackberry-700 bg-blackberry-900 text-lychee-400'
+                }`}
+                title="Hover a tree's Keep warm status dot below to refresh this and see live per-tree detail."
+              >
+                {warmBacklogTrees.length > 0
+                  ? `Keep-warm backlog: ${warmBacklogTrees.length} of ${warmTrees.size} kept-warm tree${warmTrees.size === 1 ? '' : 's'} still waiting to be sized (${warmBacklogPairs} pair${warmBacklogPairs === 1 ? '' : 's'} total). They'll be picked up on the next background sweep.`
+                  : `Keep warm: all ${warmTrees.size} kept-warm tree${warmTrees.size === 1 ? '' : 's'} caught up.`}
+                {warmUnknownTrees > 0 && ` (${warmUnknownTrees} tree${warmUnknownTrees === 1 ? '' : 's'} not checked -- cluster unreachable on last check.)`}
+              </div>
             )}
 
             {measuring ? (

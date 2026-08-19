@@ -205,8 +205,9 @@ async def list_warm_trees(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    await get_authorized_cluster(cluster_id, user, db)
+    cluster = await get_authorized_cluster(cluster_id, user, db)
     result = await db.execute(select(WarmTree).where(WarmTree.cluster_id == cluster_id))
+    rows = list(result.scalars().all())
 
     def _progress(job: job_registry.InspectJob | None) -> dict | None:
         if job is None or (job.last_pair_progress is None and job.last_sub_progress is None):
@@ -218,9 +219,51 @@ async def list_warm_trees(
             "sized": job.last_sub_progress["sized"] if job.last_sub_progress else None,
         }
 
+    # How far behind is keep-warm, per opted-in tree? load_tree_status is the
+    # same cache-mostly, cheap check the sweep loop itself runs every cycle
+    # (see warm_sweep.py) -- reusing it here just tells the user what the
+    # sweep already knows, rather than making them wait for the next pass.
+    # Best-effort: if the cluster can't be reached right now, degrade to
+    # "unknown" for every tree instead of failing this whole endpoint --
+    # unlike every other worker in this file, this one previously never
+    # touched the cluster at all (pure DB + job registry), and hover-polling
+    # while a cluster's token is expired shouldn't start erroring where it
+    # didn't before.
+    status_by_id: dict[str, dict] = {}
+    if rows:
+        cluster_snapshot = {
+            "host": cluster.host,
+            "port": cluster.port,
+            "token_encrypted": cluster.token_encrypted,
+            "insecure": cluster.insecure,
+        }
+
+        def _worker() -> dict[str, dict]:
+            qclient = make_qclient(cluster)
+            cluster_name = checked_cluster_name(qclient)
+            out: dict[str, dict] = {}
+            for w in rows:
+                try:
+                    info = load_tree_status(cluster_snapshot, cluster_name, w.source_file_id)
+                except Exception as e:
+                    out[w.source_file_id] = {"error": str(e)}
+                    continue
+                out[w.source_file_id] = info if info is not None else {"error": "tree not found"}
+            return out
+
+        try:
+            status_by_id = await asyncio.get_event_loop().run_in_executor(None, _worker)
+        except Exception:
+            status_by_id = {}
+
     warm_trees = []
-    for w in result.scalars().all():
+    for w in rows:
         running_job = job_registry.find_running(cluster_id, w.source_file_id)
+        info = status_by_id.get(w.source_file_id)
+        unmeasured = info.get("unmeasured") if info and "error" not in info else None
+        unmeasured_computable = (
+            info.get("unmeasured_computable") if info and "error" not in info else None
+        )
         warm_trees.append({
             "source_file_id": w.source_file_id,
             "last_swept_at": to_utc_iso(w.last_swept_at) if w.last_swept_at else None,
@@ -228,6 +271,8 @@ async def list_warm_trees(
             "held_reason": w.held_reason,
             "running": running_job is not None,
             "progress": _progress(running_job),
+            "unmeasured": unmeasured,
+            "unmeasured_computable": unmeasured_computable,
         })
     return {"warm_trees": warm_trees}
 
