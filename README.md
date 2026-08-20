@@ -55,20 +55,21 @@ filesystem diff API to compare it against, so it's always reported as "not sizab
 
 The general case, covering an arbitrary hand-picked selection — not necessarily a
 prefix, not necessarily just one snapshot. Selected snapshots are grouped into
-contiguous runs (bounded by whichever snapshots remain kept), and each run's true
-total is:
-
-```
-sum of adjacent pairwise diffs spanning the run  −  one direct diff between the run's two kept boundaries
-```
-
-The subtraction matters: naively summing each selected snapshot's *individual* size
-undercounts whenever two selected snapshots are adjacent, because data shared *only
-between the selected snapshots* gets missed by each one's solo number. This is
-triggered by checking multiple rows in the Snapshot sizes table and clicking
-**"Estimate combined savings"**. For a single selected snapshot, this formula reduces
-algebraically to exactly the individual-size number from question 2 — it's a
-generalization, not a competing calculation.
+contiguous runs (bounded by whichever snapshots remain kept). A run consisting of
+exactly one deleted snapshot with a real kept snapshot on both sides — by far the
+most common shape, since it's what checking one row and clicking produces — reuses
+question 2's three-way engine directly, so it's always exactly the individual-size
+number, not a separately-derived one. A run of more than one snapshot instead sums
+the adjacent pairwise diffs spanning it and subtracts one direct diff between the
+run's two kept boundaries — naively summing each snapshot's *individual* size would
+undercount whenever two selected snapshots are adjacent, because data shared *only
+between the selected snapshots* gets missed by each one's solo number, so the
+subtraction corrects for that. (This multi-snapshot formula sums independently
+measured *totals* rather than intersecting byte ranges the way the three-way engine
+does, so — unlike the single-snapshot case — it can drift from the true figure for a
+heavily-rewritten file whose changed regions land at different offsets each
+comparison; a known, unresolved gap, not a hidden one.) Triggered by checking
+multiple rows in the Snapshot sizes table and clicking **"Estimate combined savings"**.
 
 ### 4. "I need to free up N — what should I delete, and where?"
 
@@ -149,9 +150,16 @@ backend` in that case).
     Once opted in, a status dot next to the checkbox shows what the sweep is
     actually doing: gray before its first pass, a pulsing dot while a sweep is
     currently running (hover for live pair/file progress), green after a
-    successful pass, red if the last attempt failed, or amber if the tree's
-    remaining history is permanently capped by a locked/replication-owned
-    snapshot. Hover any state for the full detail and timestamp.
+    successful pass with nothing left pending, amber if a completed pass still
+    left pairs unmeasured (new snapshots landed mid-sweep, a pair needs a retry,
+    or this tree just hasn't come back up in the queue yet — it'll be picked up
+    on the next pass), red if the last attempt failed, or a darker amber if the
+    tree's remaining history is permanently capped by a locked/replication-owned
+    snapshot. Hover any state for the full detail and timestamp. Whenever at
+    least one tree on the cluster is kept warm, a banner above the table
+    summarizes the fleet-wide picture — how many opted-in trees still have a
+    backlog and how many pairs total — so a lagging sweep is visible without
+    hovering over every row.
   - **Refresh** (top right) — bypass the 5-minute snapshot-listing cache and re-fetch
     from the cluster right now.
 
@@ -215,7 +223,11 @@ skipped rather than rescanned every pass — but a tree with only *some* pairs b
 is still swept for the rest of its curve, since Inspect measures everything it can and
 skips just the held pairs on its own. Each pass records its outcome back onto the
 `warm_trees` row (last swept time, error, or held status) so it can be surfaced as the
-Dashboard's status dot instead of opting in being fire-and-forget.
+Dashboard's status dot instead of opting in being fire-and-forget. The `/warm-trees`
+endpoint also re-runs the same cheap, mostly-cached unmeasured-pair check the sweep
+itself uses (`load_tree_status`) on every fetch, so the Dashboard's per-tree dot and
+fleet-wide backlog banner reflect the current state, not just what the last completed
+pass happened to record.
 
 **Backend stack**: FastAPI, SQLAlchemy (async) + asyncpg, Alembic migrations, PyJWT,
 `cryptography` (Fernet, for encrypting stored Qumulo tokens), httpx.

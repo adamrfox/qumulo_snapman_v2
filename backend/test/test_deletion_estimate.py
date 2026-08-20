@@ -72,6 +72,12 @@ class _RecordingObserver:
     def pair_done(self, older, newer, freed_bytes, *, cached) -> None:
         pass
 
+    def triple_start(self, older, target, newer) -> None:
+        pass
+
+    def triple_done(self, older, target, newer, exclusive_bytes, *, cached) -> None:
+        pass
+
     def run_result(self, run_index, freed_bytes, error) -> None:
         self.run_results[run_index] = (freed_bytes, error)
 
@@ -146,9 +152,14 @@ class ValidationTest(unittest.TestCase):
 
 
 class RunLengthOneMatchesThreeWayTest(unittest.TestCase):
-    """For a single-snapshot run, the general formula must agree exactly
-    with the already-shipped three-way engine -- this is the regression
-    guard proving the two formulas are the same math."""
+    """A single-snapshot run with a left boundary is routed straight to the
+    three-way engine (Run.is_single_with_left_boundary), not the
+    sum-and-subtract formula -- so this is really a wiring check ("does
+    run_deletion_estimate reach the same engine compute_snapshot_exclusive_
+    contribution would give directly") rather than two independently-derived
+    formulas needing to agree. See MisalignedOffsetRegressionTest below for
+    the case that motivated routing around the sum-and-subtract formula in
+    the first place."""
 
     def test_matches_compute_snapshot_exclusive_contribution(self) -> None:
         c = TestClient()
@@ -158,16 +169,12 @@ class RunLengthOneMatchesThreeWayTest(unittest.TestCase):
         c.set_tree_diff(3, 2, [_t("MODIFY", path)])
         c.set_file_diff(2, 1, path, [_f("MODIFY", 0, 4096)])
         c.set_file_diff(3, 2, path, [_f("MODIFY", 0, 4096)])
-        # Direct S1<->S3 diff needed by the run formula (not needed by the
-        # three-way engine, which never compares S1 to S3 directly). S1 and
-        # S3 hold genuinely different rewrites of this block (each MODIFY is
-        # a distinct extent), so the direct comparison must ALSO show a
-        # MODIFY here -- it would only be empty if S1 and S3 ended up with
-        # the same net data (e.g. a create-then-delete cancelling out, as in
-        # the fox-demo case below). Getting this fixture wrong is exactly
-        # the trap the formula's subtraction term exists to guard against.
-        c.set_tree_diff(3, 1, [_t("MODIFY", path)])
-        c.set_file_diff(3, 1, path, [_f("MODIFY", 0, 4096)])
+        # Deliberately no direct S1<->S3 diff registered: a single-snapshot,
+        # left-bounded run is routed to the three-way engine, which never
+        # compares S1 to S3 directly -- if that routing ever regressed back
+        # to the sum-and-subtract formula, TestClient would raise on this
+        # unregistered lookup instead of this test passing (same guard style
+        # as OldestBoundaryTest above).
 
         three_way = compute_snapshot_exclusive_contribution(c, s1, s2, s3)
 
@@ -267,6 +274,10 @@ class FoxDemoRegressionTest(unittest.TestCase):
 class MultiRunTest(unittest.TestCase):
     def test_two_independent_runs_sum_with_no_interaction(self) -> None:
         c = TestClient()
+        # Both runs are single-snapshot, left-bounded -- routed to the
+        # three-way engine, so (unlike before this module's fix) no direct
+        # S1<->S3 diff is registered for either; TestClient would raise if
+        # that ever regressed.
         # Run 1: snapshots 1,2,3 -- middle snapshot 2 exclusive of 4096 bytes.
         s1, s2, s3 = _snap(1), _snap(2), _snap(3)
         p1 = "/data/a.bin"
@@ -274,8 +285,6 @@ class MultiRunTest(unittest.TestCase):
         c.set_tree_diff(3, 2, [_t("MODIFY", p1)])
         c.set_file_diff(2, 1, p1, [_f("MODIFY", 0, 4096)])
         c.set_file_diff(3, 2, p1, [_f("MODIFY", 0, 4096)])
-        c.set_tree_diff(3, 1, [_t("MODIFY", p1)])
-        c.set_file_diff(3, 1, p1, [_f("MODIFY", 0, 4096)])
 
         # Run 2: snapshots 10,11,12 -- middle snapshot 11 exclusive of 2048 bytes.
         s10, s11, s12 = _snap(10), _snap(11), _snap(12)
@@ -284,8 +293,6 @@ class MultiRunTest(unittest.TestCase):
         c.set_tree_diff(12, 11, [_t("MODIFY", p2)])
         c.set_file_diff(11, 10, p2, [_f("MODIFY", 0, 2048)])
         c.set_file_diff(12, 11, p2, [_f("MODIFY", 0, 2048)])
-        c.set_tree_diff(12, 10, [_t("MODIFY", p2)])
-        c.set_file_diff(12, 10, p2, [_f("MODIFY", 0, 2048)])
 
         cache = _cache()
         observer = _RecordingObserver()
@@ -304,6 +311,59 @@ class MultiRunTest(unittest.TestCase):
         self.assertEqual(observer.estimate, (4096 + 2048, True))
         self.assertEqual(observer.run_results[0][0], 4096)
         self.assertEqual(observer.run_results[1][0], 2048)
+
+
+class MisalignedOffsetRegressionTest(unittest.TestCase):
+    """The real bug this module's fix addresses. The sum-and-subtract
+    formula adds and subtracts *total byte counts* from three independently
+    measured diffs -- only equal to the three-way engine's byte-range
+    *intersection* when every diff's changed extents land at identical
+    offsets, which every other fixture in this file deliberately arranges
+    (the same (offset, size) in both legs and the direct diff). A
+    heavily-rewritten file (a database, a VM image) won't cooperate: its
+    changed regions shift around between legs. Confirmed against a real
+    cluster: the per-row "Individual size" (three-way) showed ~12 GiB for
+    one snapshot while "Delete selected" for that same snapshot alone
+    reported ~29 GiB via the old formula, for the exact same
+    (prev, target, next) triple."""
+
+    def test_run_matches_three_way_not_naive_subtraction(self) -> None:
+        c = TestClient()
+        s1, s2, s3 = _snap(1), _snap(2), _snap(3)
+        path = "/data/db.bin"
+
+        # Leg 1 (L->X1): bytes [0, 100) changed relative to L.
+        c.set_tree_diff(2, 1, [_t("MODIFY", path)])
+        c.set_file_diff(2, 1, path, [_f("MODIFY", 0, 100)])
+        # Leg 2 (X1->R): bytes [50, 150) changed relative to X1 -- a
+        # DIFFERENT window, overlapping leg 1 only in [50, 100).
+        c.set_tree_diff(3, 2, [_t("MODIFY", path)])
+        c.set_file_diff(3, 2, path, [_f("MODIFY", 50, 100)])
+        # No direct S1<->S3 diff registered -- the three-way engine this run
+        # is routed to never needs one. (Before the fix, the old formula
+        # would have needed it, and depending on what it showed the naive
+        # sum [100 + 100 = 200] minus it could land anywhere -- always
+        # disagreeing with the correct, offset-aware answer whenever the
+        # legs don't line up like this.)
+
+        three_way = compute_snapshot_exclusive_contribution(c, s1, s2, s3)
+        # True exclusive byte count is the intersection of [0,100) and
+        # [50,150) -- [50,100), i.e. 50 bytes -- not the naive sum of both
+        # legs' sizes (200).
+        self.assertEqual(three_way.exclusive_bytes, 50)
+
+        cache = _cache()
+        observer = _RecordingObserver()
+        try:
+            run = Run(left=s1, right=s3, deleted=[s2])
+            run_deletion_estimate(
+                c, cache, "cluster", SRC, [run],
+                max_workers=4, observer=observer, should_stop=lambda: False,
+            )
+        finally:
+            cache.close()
+
+        self.assertEqual(observer.estimate, (50, True))
 
 
 if __name__ == "__main__":

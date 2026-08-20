@@ -41,6 +41,34 @@ No new diff engine: both terms are just calls to the existing
 compute_pair_contribution, cached in the existing pair_contribution table
 (keyed by (cluster_name, source_file_id, older_id, newer_id) already --
 it doesn't care whether the two ids are "adjacent" in any chain).
+
+CAVEAT (confirmed against a real cluster, 2026-08-20): the sum-and-subtract
+formula above sums and subtracts *total byte counts* from three
+independently-measured diffs. That's only equal to the true byte-range
+intersection when every diff's changed extents land at identical
+offsets across all three comparisons -- true for a single cleanly-aligned
+extent (and for the FoxDemo-style whole-file create/delete case), but not
+guaranteed for a heavily-rewritten file (a database, a VM image) whose
+changed regions shift around between L->X1, X1->R, and the direct L->R
+comparison. When that happens, the sum-and-subtract total can diverge
+substantially -- and did: a real tree's per-row "Individual size" (the
+three-way engine, byte-range-intersection-based) showed ~12 GiB for one
+snapshot while "Delete selected" for that same snapshot alone reported
+~29 GiB via this formula, for the exact same (prev, target, next) triple.
+
+Fix, scoped: a run of exactly one deleted snapshot with a real left
+boundary (Run.is_single_with_left_boundary) -- by far the most common
+shape, since it's what "check one box, hit Delete selected" produces --
+is routed straight to compute_snapshot_exclusive_contribution (the
+already-correct, already-cached, already-unit-tested three-way engine)
+instead of through the arithmetic below, in run_deletion_estimate. A run
+of more than one deleted snapshot still uses the sum-and-subtract formula;
+the same offset-alignment gap in principle applies there too, but
+generalizing the three-way engine's per-file *intersection* to an
+arbitrary N-snapshot run is a materially bigger change (directory
+create/delete tracking across more than two legs, not just two) that
+hasn't been proven necessary against a real case the way the
+single-snapshot one has -- a known remaining gap, not fixed here.
 """
 
 import concurrent.futures
@@ -54,6 +82,7 @@ from typing import Protocol
 from app.qumulo.api import Snapshot
 from app.qumulo.cache import Cache
 from app.qumulo.client import ApiError, ApiTimeout, Client
+from app.qumulo.compute.snapshot_exclusive import compute_snapshot_exclusive_contribution
 from app.qumulo.compute.snapshot_reclaim import (
     Interrupted,
     PairContribution,
@@ -92,6 +121,15 @@ class Run:
         if self.left is None:
             return None
         return (self.left, self.right)
+
+    @property
+    def is_single_with_left_boundary(self) -> bool:
+        """True for exactly the case compute_snapshot_exclusive_contribution
+        (the three-way engine) was built for: one deleted snapshot with a
+        real kept neighbor on both sides. run_deletion_estimate routes these
+        straight to that engine instead of the sum-and-subtract formula
+        below -- see this module's docstring CAVEAT for why."""
+        return len(self.deleted) == 1 and self.left is not None
 
 
 class SelectionError(Exception):
@@ -154,6 +192,10 @@ class DeletionEstimateObserver(Protocol):
     def run_start(self, run_index: int, total_runs: int, run: Run) -> None: ...
     def pair_start(self, older: Snapshot, newer: Snapshot) -> None: ...
     def pair_done(self, older: Snapshot, newer: Snapshot, freed_bytes: int, *, cached: bool) -> None: ...
+    def triple_start(self, older: Snapshot, target: Snapshot, newer: Snapshot) -> None: ...
+    def triple_done(
+        self, older: Snapshot, target: Snapshot, newer: Snapshot, exclusive_bytes: int, *, cached: bool
+    ) -> None: ...
     def run_result(self, run_index: int, freed_bytes: int | None, error: str | None) -> None: ...
     def estimate_result(self, total_bytes: int, complete: bool) -> None: ...
     def finish(self) -> None: ...
@@ -194,6 +236,27 @@ class WebDeletionEstimateObserver:
             {"older_id": older.id, "newer_id": newer.id, "freed_bytes": freed_bytes, "cached": cached},
         )
 
+    def triple_start(self, older: Snapshot, target: Snapshot, newer: Snapshot) -> None:
+        self._push(
+            "triple_start",
+            {
+                "older_id": older.id, "older_name": older.name, "older_date": older.timestamp[:10],
+                "target_id": target.id, "target_name": target.name, "target_date": target.timestamp[:10],
+                "newer_id": newer.id, "newer_name": newer.name, "newer_date": newer.timestamp[:10],
+            },
+        )
+
+    def triple_done(
+        self, older: Snapshot, target: Snapshot, newer: Snapshot, exclusive_bytes: int, *, cached: bool
+    ) -> None:
+        self._push(
+            "triple_done",
+            {
+                "older_id": older.id, "target_id": target.id, "newer_id": newer.id,
+                "exclusive_bytes": exclusive_bytes, "cached": cached,
+            },
+        )
+
     def run_result(self, run_index: int, freed_bytes: int | None, error: str | None) -> None:
         self._push("run_result", {"run_index": run_index, "freed_bytes": freed_bytes, "error": error})
 
@@ -220,14 +283,22 @@ def run_deletion_estimate(
 
     cached_pairs = cache.get_pairs(cluster_name, source_id)
     partials = cache.get_partials(cluster_name, source_id)
+    cached_triples = cache.get_triples(cluster_name, source_id)
+    triple_partials = cache.get_triple_partials(cluster_name, source_id)
 
     # Flatten every (older, newer) pair every run needs, tagged with which
     # run(s) and role (a pair could in principle be needed by only one run --
     # runs are separated by kept boundaries so adjacent/direct pairs never
-    # overlap across runs).
+    # overlap across runs). Runs routed to the three-way engine (see module
+    # docstring CAVEAT) contribute nothing here -- they need no pairwise
+    # diffs at all, not even a direct L<->R one.
     work: list[tuple[Snapshot, Snapshot]] = []
     seen: set[tuple[int, int]] = set()
-    for run in runs:
+    triple_run_indices: list[int] = []
+    for i, run in enumerate(runs):
+        if run.is_single_with_left_boundary:
+            triple_run_indices.append(i)
+            continue
         needed = [*run.adjacent_pairs]
         if run.direct_pair is not None:
             needed.append(run.direct_pair)
@@ -238,6 +309,7 @@ def run_deletion_estimate(
                 work.append((older, newer))
 
     results: dict[tuple[int, int], tuple[int, str | None]] = {}  # key -> (freed_bytes, error)
+    triple_results: dict[int, tuple[int, str | None]] = {}  # run_index -> (exclusive_bytes, error)
     sizing_ex = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
 
     def _compute_one(older: Snapshot, newer: Snapshot) -> None:
@@ -276,8 +348,54 @@ def run_deletion_estimate(
         results[key] = (result.freed_bytes, None)
         observer.pair_done(older, newer, result.freed_bytes, cached=False)
 
+    def _compute_triple(run_index: int) -> None:
+        run = runs[run_index]
+        prev, target, next_ = run.left, run.deleted[0], run.right
+        assert prev is not None  # guaranteed by is_single_with_left_boundary
+        key = (prev.id, target.id, next_.id)
+
+        cached = cached_triples.get(key)
+        if cached is not None:
+            observer.triple_start(prev, target, next_)
+            observer.triple_done(prev, target, next_, cached[0], cached=True)
+            triple_results[run_index] = (cached[0], None)
+            return
+
+        observer.triple_start(prev, target, next_)
+        resume = triple_partials.get(key)
+
+        def _checkpoint(sized_index: int, exclusive: int, files: int) -> None:
+            cache.put_triple_partial(
+                cluster_name, source_id, prev.id, target.id, next_.id, sized_index, exclusive, files,
+            )
+
+        try:
+            result = compute_snapshot_exclusive_contribution(
+                client, prev, target, next_,
+                max_workers=max_workers, should_stop=should_stop,
+                resume=resume, checkpoint=_checkpoint,
+            )
+        except Interrupted:
+            return
+        except Exception as e:
+            print(
+                f"[snapman] deletion-estimate triple ({prev.id},{target.id},{next_.id}) failed: {e!r}",
+                file=sys.stderr,
+            )
+            triple_results[run_index] = (0, str(e))
+            return
+
+        cache.put_triple(
+            cluster_name, source_id, prev.id, target.id, next_.id,
+            result.exclusive_bytes, result.total_files,
+        )
+        cache.delete_triple_partial(cluster_name, source_id, prev.id, target.id, next_.id)
+        triple_results[run_index] = (result.exclusive_bytes, None)
+        observer.triple_done(prev, target, next_, result.exclusive_bytes, cached=False)
+
     try:
         futures = [sizing_ex.submit(_compute_one, older, newer) for older, newer in work]
+        futures += [sizing_ex.submit(_compute_triple, i) for i in triple_run_indices]
         for fut in concurrent.futures.as_completed(futures):
             if should_stop():
                 break
@@ -288,6 +406,17 @@ def run_deletion_estimate(
     grand_total = 0
     complete = True
     for i, run in enumerate(runs):
+        if run.is_single_with_left_boundary:
+            entry = triple_results.get(i)
+            if entry is None or entry[1] is not None:
+                complete = False
+                observer.run_result(i, None, (entry[1] if entry else "not computed") or "not computed")
+                continue
+            freed = entry[0]
+            grand_total += freed
+            observer.run_result(i, freed, None)
+            continue
+
         adjacent_sum = 0
         run_error: str | None = None
         for older, newer in run.adjacent_pairs:
