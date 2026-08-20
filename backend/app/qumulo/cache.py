@@ -21,6 +21,8 @@ _TABLES = (
     "triple_contribution",
     "triple_partial",
     "run_contribution",
+    "hop_scan",
+    "hop_file_diff",
 )
 
 
@@ -123,6 +125,31 @@ class Cache:
                 total_files     INTEGER NOT NULL,
                 computed_at     REAL NOT NULL,
                 PRIMARY KEY (cluster_name, source_file_id, left_id, right_id, deleted_ids)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS hop_scan (
+                cluster_name      TEXT NOT NULL,
+                source_file_id    TEXT NOT NULL,
+                newer_id          INTEGER NOT NULL,
+                older_id          INTEGER NOT NULL,
+                files_json        TEXT NOT NULL,
+                created_dirs_json TEXT NOT NULL,
+                deleted_dirs_json TEXT NOT NULL,
+                computed_at       REAL NOT NULL,
+                PRIMARY KEY (cluster_name, source_file_id, newer_id, older_id)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS hop_file_diff (
+                cluster_name    TEXT NOT NULL,
+                source_file_id  TEXT NOT NULL,
+                newer_id        INTEGER NOT NULL,
+                older_id        INTEGER NOT NULL,
+                path            TEXT NOT NULL,
+                entries_json    TEXT NOT NULL,
+                computed_at     REAL NOT NULL,
+                PRIMARY KEY (cluster_name, source_file_id, newer_id, older_id, path)
             )"""
         )
         self._conn.commit()
@@ -373,6 +400,79 @@ class Cache:
                 "right_id, deleted_ids, exclusive_bytes, total_files, computed_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (cluster_name, source_file_id, left_id, right_id, key, exclusive_bytes, total_files, self._now()),
+            )
+            self._conn.commit()
+
+    # -- per-hop scan and per-file-per-hop diff (run_exclusive.py) ----------
+    # Finer-grained than run_contribution above: two runs that don't share
+    # an exact snapshot set (an adjusted selection -- one more/fewer
+    # snapshot, a different starting point) usually still share most of
+    # their adjacent hops. Caching at this level lets run_exclusive.py reuse
+    # whatever hops still match instead of needing an exact whole-run hit.
+    # Values here are opaque, caller-shaped data (a files dict and two dir
+    # lists; a list of diff-entry tuples) -- this layer doesn't know or care
+    # what run_exclusive.py's DiffOp/FileDiffEntry types look like, matching
+    # how snapshot_listing already just stores whatever JSON it's handed.
+
+    def get_hop_scan(
+        self, cluster_name: str, source_file_id: str, newer_id: int, older_id: int
+    ) -> tuple[dict[str, str], list[str], list[str]] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT files_json, created_dirs_json, deleted_dirs_json FROM hop_scan "
+                "WHERE cluster_name = ? AND source_file_id = ? AND newer_id = ? AND older_id = ?",
+                (cluster_name, source_file_id, newer_id, older_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0]), json.loads(row[1]), json.loads(row[2])
+
+    def put_hop_scan(
+        self,
+        cluster_name: str,
+        source_file_id: str,
+        newer_id: int,
+        older_id: int,
+        files: dict[str, str],
+        created_dirs: list[str],
+        deleted_dirs: list[str],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO hop_scan (cluster_name, source_file_id, newer_id, older_id, "
+                "files_json, created_dirs_json, deleted_dirs_json, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (cluster_name, source_file_id, newer_id, older_id,
+                 json.dumps(files), json.dumps(created_dirs), json.dumps(deleted_dirs), self._now()),
+            )
+            self._conn.commit()
+
+    def get_hop_file_diff(
+        self, cluster_name: str, source_file_id: str, newer_id: int, older_id: int, path: str
+    ) -> list[tuple[str, int, int]] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT entries_json FROM hop_file_diff WHERE cluster_name = ? AND source_file_id = ? "
+                "AND newer_id = ? AND older_id = ? AND path = ?",
+                (cluster_name, source_file_id, newer_id, older_id, path),
+            ).fetchone()
+        if row is None:
+            return None
+        return [tuple(e) for e in json.loads(row[0])]
+
+    def put_hop_file_diff(
+        self,
+        cluster_name: str,
+        source_file_id: str,
+        newer_id: int,
+        older_id: int,
+        path: str,
+        entries: list[tuple[str, int, int]],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO hop_file_diff (cluster_name, source_file_id, newer_id, older_id, "
+                "path, entries_json, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (cluster_name, source_file_id, newer_id, older_id, path, json.dumps(entries), self._now()),
             )
             self._conn.commit()
 

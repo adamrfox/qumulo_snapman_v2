@@ -471,6 +471,8 @@ def run_deletion_estimate(
         try:
             result = compute_run_exclusive_contribution(
                 client, run.chain, max_workers=max_workers, should_stop=should_stop,
+                cache=cache, cluster_name=cluster_name, source_file_id=source_id,
+                force_recompute=force_recompute,
             )
         except Interrupted:
             return

@@ -6,14 +6,22 @@ instead of two, and generalizing the ephemeral/remaining_deleted directory
 cases to a chain longer than three snapshots.
 """
 
+import tempfile
 import unittest
 
+from pathlib import Path
+
 from app.qumulo.api import Snapshot
+from app.qumulo.cache import Cache
 from app.qumulo.client import ApiError
 from app.qumulo.compute.run_exclusive import compute_run_exclusive_contribution
 from test.client import TestClient
 
 SRC = "95200597194320772806937149443"
+
+
+def _cache() -> Cache:
+    return Cache(Path(tempfile.mkdtemp()) / "cache.db")
 
 
 def _snap(id_: int) -> Snapshot:
@@ -186,6 +194,87 @@ class ChainTooShortTest(unittest.TestCase):
         L, R = _snap(1), _snap(2)
         with self.assertRaises(ValueError):
             compute_run_exclusive_contribution(c, [L, R])
+
+
+class HopLevelCachingTest(unittest.TestCase):
+    """The real scenario reported from a lab session: run a 5-snapshot
+    estimate, then trim the selection down to 4 (dropping the last one) and
+    re-estimate. A whole-run-only cache treats that as a totally different
+    run (the right boundary itself changes -- see deletion_estimate.py's
+    docstring) and gets zero benefit even though every hop the smaller run
+    needs was already computed for the bigger one. Per-hop caching should
+    fix exactly this."""
+
+    def _fixture(self) -> tuple[TestClient, list[Snapshot]]:
+        c = TestClient()
+        chain = [_snap(i) for i in range(1, 6)]  # snapshots 1..5
+        path = "/data/f.bin"
+        c.set_tree_diff(2, 1, [_t("CREATE", path)])
+        c.set_tree_diff(3, 2, [])
+        c.set_tree_diff(4, 3, [_t("DELETE", path)])
+        c.set_tree_diff(5, 4, [])  # only needed by the full 5-snapshot chain
+        c.set_file_diff(2, 1, path, [_f("CREATE", 0, 4096)])
+        c.set_attrs(3, path, _attrs("f-id", 4096, path))
+        c.set_error("f-id", ApiError(404, "fs_file_not_covered_by_snapshot_error", "gone"))
+        return c, chain
+
+    def test_trimming_the_last_deleted_snapshot_reuses_every_shared_hop(self) -> None:
+        c, chain = self._fixture()
+        cache = _cache()
+        try:
+            # Full run: delete 2,3,4, keeping 1 and 5.
+            result1 = compute_run_exclusive_contribution(
+                c, chain, cache=cache, cluster_name="cluster", source_file_id=SRC,
+            )
+            self.assertEqual(result1.exclusive_bytes, 4096)
+
+            # Trimmed run: delete 2,3, keeping 1 and 4 -- a fresh client with
+            # NOTHING registered proves every hop it needs (1->2, 2->3, 3->4)
+            # came from cache, not a fresh scan or file_diff call.
+            result2 = compute_run_exclusive_contribution(
+                TestClient(), chain[:4], cache=cache, cluster_name="cluster", source_file_id=SRC,
+            )
+            self.assertEqual(result2.exclusive_bytes, 4096)
+        finally:
+            cache.close()
+
+    def test_force_recompute_bypasses_hop_cache_and_repairs_it(self) -> None:
+        c, chain = self._fixture()
+        cache = _cache()
+        try:
+            result = compute_run_exclusive_contribution(
+                c, chain[:4], cache=cache, cluster_name="cluster", source_file_id=SRC,
+            )
+            self.assertEqual(result.exclusive_bytes, 4096)
+
+            # Corrupt one of the hop-level caches directly, simulating "a
+            # value I don't trust".
+            cache.put_hop_scan("cluster", SRC, 2, 1, {}, [], [])
+
+            # Without force_recompute, the corrupted hop cache silently
+            # produces a wrong (smaller) answer, and the client is never
+            # touched -- same cache-hit guarantee as the test above.
+            stale = compute_run_exclusive_contribution(
+                TestClient(), chain[:4], cache=cache, cluster_name="cluster", source_file_id=SRC,
+            )
+            self.assertEqual(stale.exclusive_bytes, 0)
+
+            # force_recompute re-derives the true value from the cluster and
+            # overwrites the corrupted cache entry with it.
+            fresh = compute_run_exclusive_contribution(
+                c, chain[:4], cache=cache, cluster_name="cluster", source_file_id=SRC,
+                force_recompute=True,
+            )
+            self.assertEqual(fresh.exclusive_bytes, 4096)
+
+            # The repair sticks -- a later normal (non-forced) call is
+            # correct again, still without touching the client.
+            repaired = compute_run_exclusive_contribution(
+                TestClient(), chain[:4], cache=cache, cluster_name="cluster", source_file_id=SRC,
+            )
+            self.assertEqual(repaired.exclusive_bytes, 4096)
+        finally:
+            cache.close()
 
 
 if __name__ == "__main__":

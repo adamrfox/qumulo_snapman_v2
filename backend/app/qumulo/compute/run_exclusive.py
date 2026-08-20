@@ -49,16 +49,31 @@ snapshot_reclaim.py's single-hop rename fallback):
     (_SENTINEL_SIZE). Net effect: any gap here can only undercount, never
     overcount -- the safe direction, unlike the bug this module fixes.
 
-This module is cache-agnostic, same as snapshot_exclusive.py -- caching is
-the caller's job. deletion_estimate.py caches whole-run results (keyed by
-the exact left/deleted/right snapshot ids, deleted_ids as a sorted JSON
-array since a run's length varies) in cache.py's run_contribution table,
-rather than anything finer-grained here (e.g. per-hop scans or per-file
-diff entries): that would help a *different* run that happens to share a
-hop with this one, but the far more common case is re-estimating the same
-or an adjusted selection, which a whole-run cache already serves, at a
-fraction of the storage and complexity cost. A cache hit here skips this
-engine entirely -- discovery, sweep, everything.
+Caching happens at two levels, both in deletion_estimate.py's caller:
+whole-run results (cache.py's run_contribution table, keyed by the exact
+left/deleted/right snapshot ids) are the fast path for re-running the exact
+same estimate -- an instant lookup, this engine never even runs. Below
+that, this module's own discovery and sizing steps consult a per-hop cache
+(hop_scan, hop_file_diff) so an *adjusted* selection -- one snapshot more
+or fewer, a shifted start/end -- still reuses whatever adjacent-pair hops
+it has in common with a previous run, rather than needing an exact whole-
+run match. That's the common case in practice (confirmed against a real
+lab session: shrinking a selection by one snapshot re-scanned everything
+under a whole-run-only cache, even though every hop the new selection
+needed had already been computed for the old one) -- a hop's scan and a
+file's diff at that hop are both permanently correct once computed (they
+describe two fixed, immutable snapshots), so there's no staleness risk to
+caching at this finer grain, just more rows. Directory-episode walks
+(_walk_files, for the ephemeral-directory case below) are deliberately NOT
+cached -- a smaller, rarer cost than the per-hop scans and per-file diffs.
+
+Every function here accepts an optional `cache` (plus `cluster_name`/
+`source_file_id` for keying) and `force_recompute` -- None/absent means
+"behave exactly as before this cache existed" (used by every existing
+test that doesn't care about caching), and force_recompute=True skips
+reads without skipping writes, so a forced recompute still repairs
+whatever it finds, not just the top-level result deletion_estimate.py
+caches on its own.
 """
 
 import concurrent.futures
@@ -68,6 +83,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.qumulo.api import DiffOp, FileDiffEntry, Snapshot, file_diff, snapshot_file_attrs, tree_diff_pages
+from app.qumulo.cache import Cache
 from app.qumulo.client import ApiError, Client
 from app.qumulo.compute import intervals
 from app.qumulo.compute.snapshot_reclaim import (
@@ -137,8 +153,43 @@ def _scan_hop(
     return files, created_dirs, deleted_dirs
 
 
+def _cached_scan_hop(
+    client: Client,
+    newer_id: int,
+    older_id: int,
+    state: _ScanState,
+    *,
+    cache: Cache | None,
+    cluster_name: str,
+    source_file_id: str,
+    force_recompute: bool,
+) -> tuple[dict[str, DiffOp], list[str], list[str]]:
+    if cache is not None and not force_recompute:
+        cached = cache.get_hop_scan(cluster_name, source_file_id, newer_id, older_id)
+        if cached is not None:
+            files_raw, created_dirs, deleted_dirs = cached
+            return {p: DiffOp(op) for p, op in files_raw.items()}, created_dirs, deleted_dirs
+
+    files, created_dirs, deleted_dirs = _scan_hop(client, newer_id, older_id, state)
+
+    if cache is not None:
+        cache.put_hop_scan(
+            cluster_name, source_file_id, newer_id, older_id,
+            {p: op.value for p, op in files.items()}, created_dirs, deleted_dirs,
+        )
+    return files, created_dirs, deleted_dirs
+
+
 def _discover_candidates(
-    client: Client, chain: list[Snapshot], state: _ScanState, *, max_workers: int = 16
+    client: Client,
+    chain: list[Snapshot],
+    state: _ScanState,
+    *,
+    max_workers: int = 16,
+    cache: Cache | None = None,
+    cluster_name: str = "",
+    source_file_id: str = "",
+    force_recompute: bool = False,
 ) -> dict[str, _Cand]:
     k = len(chain) - 2  # number of deleted snapshots
 
@@ -151,7 +202,11 @@ def _discover_candidates(
     scan_ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, k + 1))
     try:
         futures = [
-            scan_ex.submit(_scan_hop, client, chain[i + 1].id, chain[i].id, state)
+            scan_ex.submit(
+                _cached_scan_hop, client, chain[i + 1].id, chain[i].id, state,
+                cache=cache, cluster_name=cluster_name, source_file_id=source_file_id,
+                force_recompute=force_recompute,
+            )
             for i in range(k + 1)
         ]
         hop_results = [fut.result() for fut in futures]
@@ -257,11 +312,51 @@ def _fetch_hop_events(
         raise
 
 
-def _size_candidate(client: Client, chain: list[Snapshot], cand: _Cand) -> tuple[int, int]:
+def _cached_fetch_hop_events(
+    client: Client,
+    newer_id: int,
+    older_id: int,
+    path: str,
+    op: DiffOp,
+    *,
+    cache: Cache | None,
+    cluster_name: str,
+    source_file_id: str,
+    force_recompute: bool,
+) -> list[FileDiffEntry]:
+    if cache is not None and not force_recompute:
+        cached = cache.get_hop_file_diff(cluster_name, source_file_id, newer_id, older_id, path)
+        if cached is not None:
+            return [FileDiffEntry(DiffOp(cached_op), offset, size) for cached_op, offset, size in cached]
+
+    entries = _fetch_hop_events(client, newer_id, older_id, path, op)
+
+    if cache is not None:
+        cache.put_hop_file_diff(
+            cluster_name, source_file_id, newer_id, older_id, path,
+            [(e.op.value, e.offset, e.size) for e in entries],
+        )
+    return entries
+
+
+def _size_candidate(
+    client: Client,
+    chain: list[Snapshot],
+    cand: _Cand,
+    *,
+    cache: Cache | None = None,
+    cluster_name: str = "",
+    source_file_id: str = "",
+    force_recompute: bool = False,
+) -> tuple[int, int]:
     hops: list[list[intervals.HopEvent]] = [[] for _ in range(len(chain) - 1)]
     try:
         for hop_index, op in cand.touched_hops:
-            entries = _fetch_hop_events(client, chain[hop_index + 1].id, chain[hop_index].id, cand.path, op)
+            entries = _cached_fetch_hop_events(
+                client, chain[hop_index + 1].id, chain[hop_index].id, cand.path, op,
+                cache=cache, cluster_name=cluster_name, source_file_id=source_file_id,
+                force_recompute=force_recompute,
+            )
             hops[hop_index].extend((e.offset, e.size, e.op in (DiffOp.CREATE, DiffOp.MODIFY)) for e in entries)
     except ApiError as e:
         if _is_unresolvable(e):
@@ -285,6 +380,10 @@ def compute_run_exclusive_contribution(
     should_stop: StopFn = _never_stop,
     progress: SizingProgress = _NULL_PROGRESS,
     executor: concurrent.futures.Executor | None = None,
+    cache: Cache | None = None,
+    cluster_name: str = "",
+    source_file_id: str = "",
+    force_recompute: bool = False,
 ) -> RunExclusiveContribution:
     if len(chain) < 3:
         raise ValueError(
@@ -294,7 +393,12 @@ def compute_run_exclusive_contribution(
 
     state = _ScanState(progress, should_stop)
     candidates = sorted(
-        _discover_candidates(client, chain, state, max_workers=max_workers).values(), key=lambda c: c.path
+        _discover_candidates(
+            client, chain, state, max_workers=max_workers,
+            cache=cache, cluster_name=cluster_name, source_file_id=source_file_id,
+            force_recompute=force_recompute,
+        ).values(),
+        key=lambda c: c.path,
     )
     progress.enumeration_done()
 
@@ -307,7 +411,14 @@ def compute_run_exclusive_contribution(
     files_total = 0
     futures: list[concurrent.futures.Future[tuple[int, int]]] = []
     try:
-        futures = [ex.submit(_size_candidate, client, chain, c) for c in candidates]
+        futures = [
+            ex.submit(
+                _size_candidate, client, chain, c,
+                cache=cache, cluster_name=cluster_name, source_file_id=source_file_id,
+                force_recompute=force_recompute,
+            )
+            for c in candidates
+        ]
         for fut in concurrent.futures.as_completed(futures):
             if should_stop():
                 raise Interrupted()

@@ -179,11 +179,14 @@ cluster):
   "Individual size" table described above. Each row has its own **Delete**, and
   checking multiple rows reveals an **Estimate combined savings** action plus a
   **Delete selected** bulk action. A run of two or more selected snapshots is
-  cached by its exact snapshot ids (like every other reclaim number in this app),
-  so re-running or slightly adjusting an estimate doesn't repeat the full
-  cluster scan. Since that's a diff between fixed, immutable snapshots it can't
-  actually go stale on its own — but an **Ignore cache** checkbox next to the
-  button is there anyway, for the rare "I don't trust this number" case: it
+  cached two ways: the whole result, by its exact snapshot ids, for an instant
+  answer on an exact repeat; and underneath that, each adjacent-snapshot "hop"
+  it scanned, so *adjusting* a selection (one more or fewer snapshot, a shifted
+  start or end) reuses whatever hops it still has in common with a previous
+  estimate instead of rescanning everything. Since these are all diffs between
+  fixed, immutable snapshots, none of it can actually go stale on its own — but
+  an **Ignore cache** checkbox next to the button is there anyway, for the rare
+  "I don't trust this number" case: it
   recomputes from the cluster and overwrites the cached value with the fresh
   one, repairing it for every future estimate too, not just that one click.
 
