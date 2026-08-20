@@ -485,7 +485,13 @@ async def get_snapshot_sizes(
                     {
                         "id": snap.id,
                         "name": snap.name,
-                        "date": snap.timestamp[:10],
+                        # Includes time-of-day, not just the date -- a policy
+                        # taking several snapshots a day is common enough
+                        # that the date alone doesn't identify one uniquely,
+                        # and this is the one place across the app where a
+                        # snapshot needs to be told apart without reading its
+                        # (often auto-generated, less legible) name.
+                        "date": snap.timestamp[:16].replace("T", " "),
                         "age_days": age_days(snap.timestamp, now),
                         "exclusive_bytes": exclusive_bytes,
                         "total_files": total_files,
