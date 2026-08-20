@@ -142,6 +142,7 @@ export default function InspectDetail() {
   const [sizeFilterDate, setSizeFilterDate] = useState('')
 
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [estimateForceRecompute, setEstimateForceRecompute] = useState(false)
   const [estimateRunning, setEstimateRunning] = useState(false)
   const [estimateStatusMsg, setEstimateStatusMsg] = useState('')
   const [estimateResult, setEstimateResult] = useState<{ totalBytes: number; complete: boolean; incompleteRuns: number } | null>(null)
@@ -620,7 +621,9 @@ export default function InspectDetail() {
     let incompleteRuns = 0
 
     try {
-      const { job_id } = await api.inspect.estimateDeletion(clusterId, sourceFileId, Array.from(selected))
+      const { job_id } = await api.inspect.estimateDeletion(
+        clusterId, sourceFileId, Array.from(selected), estimateForceRecompute
+      )
       const es = new EventSource(`/api/clusters/${clusterId}/jobs/${job_id}/stream`, { withCredentials: true })
       estimateEsRef.current = es
 
@@ -1204,7 +1207,18 @@ export default function InspectDetail() {
             <div className="border-t border-blackberry-700 bg-blackberry-850 px-4 py-3">
               <div className="flex items-center justify-between">
                 <p className="text-sm text-lychee-100">{selected.size} snapshot{selected.size > 1 ? 's' : ''} selected</p>
-                <div className="flex gap-2">
+                <div className="flex items-center gap-3">
+                  <label
+                    className="flex items-center gap-1.5 text-xs text-lychee-500"
+                    title="Skip cached pair/triple/run results and recompute everything for this estimate from the cluster. A cached value here can't actually go stale on its own (it's a diff between two fixed snapshots), so this is only for if you don't trust a number you're seeing -- one forced recompute overwrites the cache with the fresh value, fixing it for every future estimate too, not just this one."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={estimateForceRecompute}
+                      onChange={e => setEstimateForceRecompute(e.target.checked)}
+                    />
+                    Ignore cache
+                  </label>
                   <button
                     onClick={startEstimate}
                     disabled={estimateRunning}

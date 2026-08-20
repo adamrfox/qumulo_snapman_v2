@@ -81,7 +81,7 @@ class _RecordingObserver:
     def multi_start(self, left, deleted, right) -> None:
         pass
 
-    def multi_done(self, left, deleted, right, exclusive_bytes) -> None:
+    def multi_done(self, left, deleted, right, exclusive_bytes, *, cached) -> None:
         pass
 
     def run_result(self, run_index, freed_bytes, error) -> None:
@@ -373,6 +373,81 @@ class MisalignedOffsetRegressionTest(unittest.TestCase):
             cache.close()
 
         self.assertEqual(observer.estimate, (50, True))
+
+
+class RunCachingTest(unittest.TestCase):
+    """A multi-snapshot run's result is cached (run_contribution) and reused
+    on a later call without touching the cluster again; force_recompute
+    bypasses that and repairs the cache with a freshly-derived value."""
+
+    def _fixture(self) -> tuple[TestClient, Snapshot, Snapshot, Snapshot, Snapshot]:
+        c = TestClient()
+        L, X1, X2, R = _snap(1), _snap(2), _snap(3), _snap(4)
+        path = "/data/db.bin"
+        c.set_tree_diff(2, 1, [_t("CREATE", path)])
+        c.set_tree_diff(3, 2, [])
+        c.set_tree_diff(4, 3, [_t("DELETE", path)])
+        c.set_file_diff(2, 1, path, [_f("CREATE", 0, 4096)])
+        c.set_attrs(3, path, _attrs("db-id", 4096, path))
+        c.set_error("db-id", ApiError(404, "fs_file_not_covered_by_snapshot_error", "gone"))
+        return c, L, X1, X2, R
+
+    def test_second_call_is_served_from_cache_without_touching_the_client(self) -> None:
+        c, L, X1, X2, R = self._fixture()
+        run = Run(left=L, right=R, deleted=[X1, X2])
+        cache = _cache()
+        try:
+            run_deletion_estimate(
+                c, cache, "cluster", SRC, [run],
+                max_workers=4, observer=_RecordingObserver(), should_stop=lambda: False,
+            )
+
+            # A second client with nothing registered -- if the second call
+            # touched it at all (rather than being served from cache),
+            # TestClient would raise AssertionError.
+            observer2 = _RecordingObserver()
+            run_deletion_estimate(
+                TestClient(), cache, "cluster", SRC, [run],
+                max_workers=4, observer=observer2, should_stop=lambda: False,
+            )
+            self.assertEqual(observer2.estimate, (4096, True))
+        finally:
+            cache.close()
+
+    def test_force_recompute_bypasses_and_repairs_the_cache(self) -> None:
+        c, L, X1, X2, R = self._fixture()
+        run = Run(left=L, right=R, deleted=[X1, X2])
+        cache = _cache()
+        try:
+            run_deletion_estimate(
+                c, cache, "cluster", SRC, [run],
+                max_workers=4, observer=_RecordingObserver(), should_stop=lambda: False,
+            )
+
+            # Simulate "a value I don't trust" by corrupting the cache directly.
+            cache.put_run("cluster", SRC, L.id, R.id, [X1.id, X2.id], 999_999, 1)
+
+            # Without force_recompute, the corrupted value comes straight back
+            # (and the client is never touched -- same guarantee as above).
+            stale = _RecordingObserver()
+            run_deletion_estimate(
+                TestClient(), cache, "cluster", SRC, [run],
+                max_workers=4, observer=stale, should_stop=lambda: False,
+            )
+            self.assertEqual(stale.estimate, (999_999, True))
+
+            # force_recompute re-derives the true value from the cluster and
+            # overwrites the cache with it.
+            fresh = _RecordingObserver()
+            run_deletion_estimate(
+                c, cache, "cluster", SRC, [run],
+                max_workers=4, observer=fresh, should_stop=lambda: False,
+                force_recompute=True,
+            )
+            self.assertEqual(fresh.estimate, (4096, True))
+            self.assertEqual(cache.get_run("cluster", SRC, L.id, R.id, [X1.id, X2.id]), (4096, 1))
+        finally:
+            cache.close()
 
 
 if __name__ == "__main__":

@@ -49,11 +49,16 @@ snapshot_reclaim.py's single-hop rename fallback):
     (_SENTINEL_SIZE). Net effect: any gap here can only undercount, never
     overcount -- the safe direction, unlike the bug this module fixes.
 
-No caching: unlike the pairwise/three-way engines, there's no fixed-arity
-cache table for an arbitrary-length run, and this is a heavier, far less
-frequently exercised path (a user explicitly multi-selecting snapshots to
-delete together) than the sweep/goal-solver-driven pairwise and triple
-engines -- not worth a new migration for.
+This module is cache-agnostic, same as snapshot_exclusive.py -- caching is
+the caller's job. deletion_estimate.py caches whole-run results (keyed by
+the exact left/deleted/right snapshot ids, deleted_ids as a sorted JSON
+array since a run's length varies) in cache.py's run_contribution table,
+rather than anything finer-grained here (e.g. per-hop scans or per-file
+diff entries): that would help a *different* run that happens to share a
+hop with this one, but the far more common case is re-estimating the same
+or an adjusted selection, which a whole-run cache already serves, at a
+fraction of the storage and complexity cost. A cache hit here skips this
+engine entirely -- discovery, sweep, everything.
 """
 
 import concurrent.futures

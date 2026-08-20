@@ -20,6 +20,7 @@ _TABLES = (
     "pair_partial",
     "triple_contribution",
     "triple_partial",
+    "run_contribution",
 )
 
 
@@ -109,6 +110,19 @@ class Cache:
                 partial_files     INTEGER NOT NULL,
                 updated_at        REAL NOT NULL,
                 PRIMARY KEY (cluster_name, source_file_id, prev_id, target_id, next_id)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_contribution (
+                cluster_name    TEXT NOT NULL,
+                source_file_id  TEXT NOT NULL,
+                left_id         INTEGER NOT NULL,
+                right_id        INTEGER NOT NULL,
+                deleted_ids     TEXT NOT NULL,
+                exclusive_bytes INTEGER NOT NULL,
+                total_files     INTEGER NOT NULL,
+                computed_at     REAL NOT NULL,
+                PRIMARY KEY (cluster_name, source_file_id, left_id, right_id, deleted_ids)
             )"""
         )
         self._conn.commit()
@@ -320,6 +334,45 @@ class Cache:
                 "DELETE FROM triple_partial WHERE cluster_name = ? AND source_file_id = ? "
                 "AND prev_id = ? AND target_id = ? AND next_id = ?",
                 (cluster_name, source_file_id, prev_id, target_id, next_id),
+            )
+            self._conn.commit()
+
+    # -- per-run (arbitrary-length deleted-chain) exclusive contribution ----
+    # Whole-run results only (no partial/resume support, unlike pairs and
+    # triples above) -- see compute/run_exclusive.py's module docstring for
+    # why. deleted_ids is stored as a JSON array of sorted snapshot ids,
+    # since a run's length varies (no fixed-arity columns to key on the way
+    # pair/triple contribution can).
+
+    def get_run(
+        self, cluster_name: str, source_file_id: str, left_id: int, right_id: int, deleted_ids: list[int]
+    ) -> tuple[int, int] | None:
+        key = json.dumps(sorted(deleted_ids))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT exclusive_bytes, total_files FROM run_contribution WHERE cluster_name = ? "
+                "AND source_file_id = ? AND left_id = ? AND right_id = ? AND deleted_ids = ?",
+                (cluster_name, source_file_id, left_id, right_id, key),
+            ).fetchone()
+        return (row[0], row[1]) if row is not None else None
+
+    def put_run(
+        self,
+        cluster_name: str,
+        source_file_id: str,
+        left_id: int,
+        right_id: int,
+        deleted_ids: list[int],
+        exclusive_bytes: int,
+        total_files: int,
+    ) -> None:
+        key = json.dumps(sorted(deleted_ids))
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO run_contribution (cluster_name, source_file_id, left_id, "
+                "right_id, deleted_ids, exclusive_bytes, total_files, computed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (cluster_name, source_file_id, left_id, right_id, key, exclusive_bytes, total_files, self._now()),
             )
             self._conn.commit()
 

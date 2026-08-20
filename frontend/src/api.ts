@@ -117,9 +117,10 @@ export const api = {
       request<{ job_id: string; reused: boolean }>(
         'POST', `/api/clusters/${clusterId}/groups/${sourceFileId}/size-snapshots`, { path, include_held: includeHeld }
       ),
-    estimateDeletion: (clusterId: string, sourceFileId: string, snapshotIds: number[]) =>
+    estimateDeletion: (clusterId: string, sourceFileId: string, snapshotIds: number[], forceRecompute = false) =>
       request<{ job_id: string; reused: boolean }>(
-        'POST', `/api/clusters/${clusterId}/groups/${sourceFileId}/estimate-deletion`, { snapshot_ids: snapshotIds }
+        'POST', `/api/clusters/${clusterId}/groups/${sourceFileId}/estimate-deletion`,
+        { snapshot_ids: snapshotIds, force_recompute: forceRecompute }
       ),
     cancelInspect: (clusterId: string, jobId: string) =>
       request<{ ok: boolean }>('POST', `/api/clusters/${clusterId}/jobs/${jobId}/cancel`),

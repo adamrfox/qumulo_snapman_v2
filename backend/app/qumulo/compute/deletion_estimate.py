@@ -219,7 +219,7 @@ class DeletionEstimateObserver(Protocol):
     ) -> None: ...
     def multi_start(self, left: Snapshot, deleted: list[Snapshot], right: Snapshot) -> None: ...
     def multi_done(
-        self, left: Snapshot, deleted: list[Snapshot], right: Snapshot, exclusive_bytes: int
+        self, left: Snapshot, deleted: list[Snapshot], right: Snapshot, exclusive_bytes: int, *, cached: bool
     ) -> None: ...
     def run_result(self, run_index: int, freed_bytes: int | None, error: str | None) -> None: ...
     def estimate_result(self, total_bytes: int, complete: bool) -> None: ...
@@ -293,13 +293,13 @@ class WebDeletionEstimateObserver:
         )
 
     def multi_done(
-        self, left: Snapshot, deleted: list[Snapshot], right: Snapshot, exclusive_bytes: int
+        self, left: Snapshot, deleted: list[Snapshot], right: Snapshot, exclusive_bytes: int, *, cached: bool
     ) -> None:
         self._push(
             "multi_done",
             {
                 "left_id": left.id, "deleted_ids": [s.id for s in deleted], "right_id": right.id,
-                "exclusive_bytes": exclusive_bytes,
+                "exclusive_bytes": exclusive_bytes, "cached": cached,
             },
         )
 
@@ -323,13 +323,23 @@ def run_deletion_estimate(
     max_workers: int,
     observer: DeletionEstimateObserver,
     should_stop: StopFn,
+    force_recompute: bool = False,
 ) -> None:
+    """force_recompute skips reading any cached pair/triple/run result for
+    this call -- everything gets recomputed from the cluster -- but still
+    writes the fresh results back to cache afterward, same as a normal run.
+    A cached value here can only ever be *correct forever* (it's a
+    deterministic property of two or more specific immutable snapshots, not
+    something that can drift), so this exists as a manual escape hatch for
+    "I don't trust a value I'm seeing" rather than because cache entries
+    actually go stale -- one forced recompute repairs it for every future
+    estimate too, not just this one."""
     for i, run in enumerate(runs):
         observer.run_start(i, len(runs), run)
 
-    cached_pairs = cache.get_pairs(cluster_name, source_id)
+    cached_pairs = {} if force_recompute else cache.get_pairs(cluster_name, source_id)
     partials = cache.get_partials(cluster_name, source_id)
-    cached_triples = cache.get_triples(cluster_name, source_id)
+    cached_triples = {} if force_recompute else cache.get_triples(cluster_name, source_id)
     triple_partials = cache.get_triple_partials(cluster_name, source_id)
 
     # Flatten every (older, newer) pair every run needs, tagged with which
@@ -447,6 +457,16 @@ def run_deletion_estimate(
     def _compute_multi(run_index: int) -> None:
         run = runs[run_index]
         assert run.left is not None  # guaranteed by needs_run_exclusive_engine
+        deleted_ids = [s.id for s in run.deleted]
+
+        if not force_recompute:
+            cached = cache.get_run(cluster_name, source_id, run.left.id, run.right.id, deleted_ids)
+            if cached is not None:
+                observer.multi_start(run.left, run.deleted, run.right)
+                multi_results[run_index] = (cached[0], None)
+                observer.multi_done(run.left, run.deleted, run.right, cached[0], cached=True)
+                return
+
         observer.multi_start(run.left, run.deleted, run.right)
         try:
             result = compute_run_exclusive_contribution(
@@ -462,8 +482,12 @@ def run_deletion_estimate(
             multi_results[run_index] = (0, str(e))
             return
 
+        cache.put_run(
+            cluster_name, source_id, run.left.id, run.right.id, deleted_ids,
+            result.exclusive_bytes, result.total_files,
+        )
         multi_results[run_index] = (result.exclusive_bytes, None)
-        observer.multi_done(run.left, run.deleted, run.right, result.exclusive_bytes)
+        observer.multi_done(run.left, run.deleted, run.right, result.exclusive_bytes, cached=False)
 
     try:
         futures = [sizing_ex.submit(_compute_one, older, newer) for older, newer in work]

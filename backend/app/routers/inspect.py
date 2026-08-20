@@ -1376,6 +1376,14 @@ async def _run_size_snapshots_task(
 
 class EstimateDeletionRequest(BaseModel):
     snapshot_ids: list[int]
+    # Skips reading cached pair/triple/run results for this estimate --
+    # everything is recomputed from the cluster and the (correct-forever,
+    # since these are diffs between immutable snapshots) cache rows are
+    # simply overwritten with the fresh values, repairing them for every
+    # future estimate too. Not needed in normal operation; an escape hatch
+    # for "I don't trust a number I'm seeing" -- see run_deletion_estimate's
+    # docstring.
+    force_recompute: bool = False
 
 
 @router.post("/{cluster_id}/groups/{source_file_id}/estimate-deletion", status_code=202)
@@ -1457,7 +1465,11 @@ async def start_estimate_deletion(
         "token_encrypted": cluster.token_encrypted,
         "insecure": cluster.insecure,
     }
-    task = asyncio.create_task(_run_estimate_deletion_task(job, cluster_snapshot, cluster_name, source_file_id, runs))
+    task = asyncio.create_task(
+        _run_estimate_deletion_task(
+            job, cluster_snapshot, cluster_name, source_file_id, runs, req.force_recompute
+        )
+    )
     job.task = task
 
     return {"job_id": job.id, "reused": False}
@@ -1469,6 +1481,7 @@ async def _run_estimate_deletion_task(
     cluster_name: str,
     source_file_id: str,
     runs: list,
+    force_recompute: bool = False,
 ) -> None:
     loop = asyncio.get_event_loop()
     error_message: str | None = None
@@ -1500,6 +1513,7 @@ async def _run_estimate_deletion_task(
                 max_workers=settings.file_workers,
                 observer=observer,
                 should_stop=lambda: job.done,
+                force_recompute=force_recompute,
             )
         except UnsupportedVersionError as e:
             error_message = str(e)
