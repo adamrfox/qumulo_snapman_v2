@@ -78,6 +78,12 @@ class _RecordingObserver:
     def triple_done(self, older, target, newer, exclusive_bytes, *, cached) -> None:
         pass
 
+    def multi_start(self, left, deleted, right) -> None:
+        pass
+
+    def multi_done(self, left, deleted, right, exclusive_bytes) -> None:
+        pass
+
     def run_result(self, run_index, freed_bytes, error) -> None:
         self.run_results[run_index] = (freed_bytes, error)
 
@@ -243,7 +249,10 @@ class FoxDemoRegressionTest(unittest.TestCase):
         c.set_tree_diff(2, 1, [_t("CREATE", path)])   # file created between L and A
         c.set_tree_diff(3, 2, [])                      # unchanged between A and B
         c.set_tree_diff(4, 3, [_t("DELETE", path)])    # deleted between B and R
-        c.set_tree_diff(4, 1, [])                       # direct L<->R: net no-op, invisible
+        # No direct L<->R tree diff registered: the run engine (2+ deleted
+        # snapshots with a left boundary) never compares L to R directly --
+        # see run_exclusive.py.
+        c.set_file_diff(2, 1, path, [_f("CREATE", 0, FILE_SIZE)])
 
         c.set_attrs(3, path, _attrs("copy-id", FILE_SIZE, path))
         # Confirms the file is truly gone by R (not renamed) via a file_id

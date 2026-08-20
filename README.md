@@ -59,17 +59,20 @@ contiguous runs (bounded by whichever snapshots remain kept). A run consisting o
 exactly one deleted snapshot with a real kept snapshot on both sides — by far the
 most common shape, since it's what checking one row and clicking produces — reuses
 question 2's three-way engine directly, so it's always exactly the individual-size
-number, not a separately-derived one. A run of more than one snapshot instead sums
-the adjacent pairwise diffs spanning it and subtracts one direct diff between the
-run's two kept boundaries — naively summing each snapshot's *individual* size would
-undercount whenever two selected snapshots are adjacent, because data shared *only
-between the selected snapshots* gets missed by each one's solo number, so the
-subtraction corrects for that. (This multi-snapshot formula sums independently
-measured *totals* rather than intersecting byte ranges the way the three-way engine
-does, so — unlike the single-snapshot case — it can drift from the true figure for a
-heavily-rewritten file whose changed regions land at different offsets each
-comparison; a known, unresolved gap, not a hidden one.) Triggered by checking
-multiple rows in the Snapshot sizes table and clicking **"Estimate combined savings"**.
+number, not a separately-derived one. A run of two or more deleted snapshots with a
+real left boundary is answered by a byte-range-aware generalization of that same
+three-way engine (`compute/run_exclusive.py`) rather than by summing each snapshot's
+individual size — naively summing would undercount whenever two selected snapshots
+are adjacent, because data shared *only between the selected snapshots* gets missed
+by each one's solo number. (An earlier version of this formula instead summed and
+subtracted independently-measured *totals*, which could drift from the true figure
+for a heavily-rewritten file whose changed regions land at different offsets each
+comparison — confirmed on a real cluster and fixed for both run shapes.) A run
+touching the tree's actual oldest snapshot needs neither engine and is simply the
+sum of its adjacent pairwise diffs, regardless of length — with no kept boundary
+before it, there's nothing for a total-summing shortcut to get wrong. Triggered by
+checking multiple rows in the Snapshot sizes table and clicking **"Estimate combined
+savings"**.
 
 ### 4. "I need to free up N — what should I delete, and where?"
 
@@ -261,8 +264,11 @@ snapshot-diff REST APIs (`api.py`, `client.py`), then the actual math in
   curve.
 - `snapshot_exclusive.py` / `snapshot_exclusive_job.py` — three-way diff engine,
   powers per-snapshot Individual size.
+- `run_exclusive.py` — N-snapshot generalization of the three-way engine, for
+  deleting two or more adjacent selected snapshots together.
 - `deletion_estimate.py` — arbitrary-set diff engine, powers the combined-selection
-  estimate.
+  estimate; routes each selected run to whichever of the above actually answers it
+  correctly.
 - `curve.py`, `groups.py`, `reclaim.py`, `intervals.py` — supporting math (curve
   row grouping, prune-prefix/age logic, interval arithmetic).
 

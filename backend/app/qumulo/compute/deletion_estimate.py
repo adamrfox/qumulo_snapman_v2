@@ -27,6 +27,13 @@ strict generalization, not a competing formula.
 Runs never share data with each other (a kept boundary sits between any
 two runs), so totals across runs simply add -- no new math needed there.
 
+As of the fix below, the subtraction step here is never actually reached:
+every run with a real left boundary (any length) is intercepted upstream by
+a dedicated engine before hitting this arithmetic at all. It's kept as the
+formula's derivation and as the still-genuinely-used no-subtraction path for
+a run touching the group's oldest snapshot (see the edge case just below) --
+not dead weight, just no longer doing double duty as the general case too.
+
 Edge case: a run can reach all the way back to the group's actual oldest
 snapshot, in which case there's no L to serve as a boundary -- Run.left is
 None, and freed(run) is just the plain adjacent-chain sum with no
@@ -56,19 +63,25 @@ three-way engine, byte-range-intersection-based) showed ~12 GiB for one
 snapshot while "Delete selected" for that same snapshot alone reported
 ~29 GiB via this formula, for the exact same (prev, target, next) triple.
 
-Fix, scoped: a run of exactly one deleted snapshot with a real left
-boundary (Run.is_single_with_left_boundary) -- by far the most common
-shape, since it's what "check one box, hit Delete selected" produces --
-is routed straight to compute_snapshot_exclusive_contribution (the
-already-correct, already-cached, already-unit-tested three-way engine)
-instead of through the arithmetic below, in run_deletion_estimate. A run
-of more than one deleted snapshot still uses the sum-and-subtract formula;
-the same offset-alignment gap in principle applies there too, but
-generalizing the three-way engine's per-file *intersection* to an
-arbitrary N-snapshot run is a materially bigger change (directory
-create/delete tracking across more than two legs, not just two) that
-hasn't been proven necessary against a real case the way the
-single-snapshot one has -- a known remaining gap, not fixed here.
+Fix: a run of exactly one deleted snapshot with a real left boundary
+(Run.is_single_with_left_boundary) -- by far the most common shape, since
+it's what "check one box, hit Delete selected" produces -- is routed
+straight to compute_snapshot_exclusive_contribution (the already-correct,
+already-cached, already-unit-tested three-way engine) instead of through
+the arithmetic below. A run of two or more deleted snapshots with a real
+left boundary (Run.needs_run_exclusive_engine) is routed to
+compute/run_exclusive.py's compute_run_exclusive_contribution instead --
+a proper generalization of the three-way engine's byte-range logic to an
+arbitrary chain, not more total-summing (see that module's docstring for
+why the same sum-and-subtract trap reappears, worse, once there's more
+than one deleted snapshot in between, and why fixing it needs a real
+interval sweep). A run touching the group's actual oldest snapshot
+(Run.left is None) needs neither fix and keeps using the plain
+adjacent-chain sum below regardless of length: with no left boundary to
+subtract against, every hop's diff is measured and summed independently
+with no cross-hop total-arithmetic, so the offset-alignment bug can't
+arise there in the first place (see intervals.run_exclusive_size's
+docstring for the precise reason mixing hop totals is unsafe in general).
 """
 
 import concurrent.futures
@@ -82,6 +95,7 @@ from typing import Protocol
 from app.qumulo.api import Snapshot
 from app.qumulo.cache import Cache
 from app.qumulo.client import ApiError, ApiTimeout, Client
+from app.qumulo.compute.run_exclusive import compute_run_exclusive_contribution
 from app.qumulo.compute.snapshot_exclusive import compute_snapshot_exclusive_contribution
 from app.qumulo.compute.snapshot_reclaim import (
     Interrupted,
@@ -130,6 +144,13 @@ class Run:
         straight to that engine instead of the sum-and-subtract formula
         below -- see this module's docstring CAVEAT for why."""
         return len(self.deleted) == 1 and self.left is not None
+
+    @property
+    def needs_run_exclusive_engine(self) -> bool:
+        """True for a run of two or more deleted snapshots with a real left
+        boundary -- routed to compute/run_exclusive.py's engine instead of
+        the sum-and-subtract formula below. See this module's docstring."""
+        return len(self.deleted) >= 2 and self.left is not None
 
 
 class SelectionError(Exception):
@@ -196,6 +217,10 @@ class DeletionEstimateObserver(Protocol):
     def triple_done(
         self, older: Snapshot, target: Snapshot, newer: Snapshot, exclusive_bytes: int, *, cached: bool
     ) -> None: ...
+    def multi_start(self, left: Snapshot, deleted: list[Snapshot], right: Snapshot) -> None: ...
+    def multi_done(
+        self, left: Snapshot, deleted: list[Snapshot], right: Snapshot, exclusive_bytes: int
+    ) -> None: ...
     def run_result(self, run_index: int, freed_bytes: int | None, error: str | None) -> None: ...
     def estimate_result(self, total_bytes: int, complete: bool) -> None: ...
     def finish(self) -> None: ...
@@ -257,6 +282,27 @@ class WebDeletionEstimateObserver:
             },
         )
 
+    def multi_start(self, left: Snapshot, deleted: list[Snapshot], right: Snapshot) -> None:
+        self._push(
+            "multi_start",
+            {
+                "left_id": left.id, "left_name": left.name, "left_date": left.timestamp[:10],
+                "deleted_ids": [s.id for s in deleted], "deleted_names": [s.name for s in deleted],
+                "right_id": right.id, "right_name": right.name, "right_date": right.timestamp[:10],
+            },
+        )
+
+    def multi_done(
+        self, left: Snapshot, deleted: list[Snapshot], right: Snapshot, exclusive_bytes: int
+    ) -> None:
+        self._push(
+            "multi_done",
+            {
+                "left_id": left.id, "deleted_ids": [s.id for s in deleted], "right_id": right.id,
+                "exclusive_bytes": exclusive_bytes,
+            },
+        )
+
     def run_result(self, run_index: int, freed_bytes: int | None, error: str | None) -> None:
         self._push("run_result", {"run_index": run_index, "freed_bytes": freed_bytes, "error": error})
 
@@ -295,9 +341,13 @@ def run_deletion_estimate(
     work: list[tuple[Snapshot, Snapshot]] = []
     seen: set[tuple[int, int]] = set()
     triple_run_indices: list[int] = []
+    multi_run_indices: list[int] = []
     for i, run in enumerate(runs):
         if run.is_single_with_left_boundary:
             triple_run_indices.append(i)
+            continue
+        if run.needs_run_exclusive_engine:
+            multi_run_indices.append(i)
             continue
         needed = [*run.adjacent_pairs]
         if run.direct_pair is not None:
@@ -310,6 +360,7 @@ def run_deletion_estimate(
 
     results: dict[tuple[int, int], tuple[int, str | None]] = {}  # key -> (freed_bytes, error)
     triple_results: dict[int, tuple[int, str | None]] = {}  # run_index -> (exclusive_bytes, error)
+    multi_results: dict[int, tuple[int, str | None]] = {}  # run_index -> (exclusive_bytes, error)
     sizing_ex = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
 
     def _compute_one(older: Snapshot, newer: Snapshot) -> None:
@@ -393,9 +444,31 @@ def run_deletion_estimate(
         triple_results[run_index] = (result.exclusive_bytes, None)
         observer.triple_done(prev, target, next_, result.exclusive_bytes, cached=False)
 
+    def _compute_multi(run_index: int) -> None:
+        run = runs[run_index]
+        assert run.left is not None  # guaranteed by needs_run_exclusive_engine
+        observer.multi_start(run.left, run.deleted, run.right)
+        try:
+            result = compute_run_exclusive_contribution(
+                client, run.chain, max_workers=max_workers, should_stop=should_stop,
+            )
+        except Interrupted:
+            return
+        except Exception as e:
+            print(
+                f"[snapman] deletion-estimate multi-run ({run.left.id}..{run.right.id}) failed: {e!r}",
+                file=sys.stderr,
+            )
+            multi_results[run_index] = (0, str(e))
+            return
+
+        multi_results[run_index] = (result.exclusive_bytes, None)
+        observer.multi_done(run.left, run.deleted, run.right, result.exclusive_bytes)
+
     try:
         futures = [sizing_ex.submit(_compute_one, older, newer) for older, newer in work]
         futures += [sizing_ex.submit(_compute_triple, i) for i in triple_run_indices]
+        futures += [sizing_ex.submit(_compute_multi, i) for i in multi_run_indices]
         for fut in concurrent.futures.as_completed(futures):
             if should_stop():
                 break
@@ -408,6 +481,17 @@ def run_deletion_estimate(
     for i, run in enumerate(runs):
         if run.is_single_with_left_boundary:
             entry = triple_results.get(i)
+            if entry is None or entry[1] is not None:
+                complete = False
+                observer.run_result(i, None, (entry[1] if entry else "not computed") or "not computed")
+                continue
+            freed = entry[0]
+            grand_total += freed
+            observer.run_result(i, freed, None)
+            continue
+
+        if run.needs_run_exclusive_engine:
+            entry = multi_results.get(i)
             if entry is None or entry[1] is not None:
                 complete = False
                 observer.run_result(i, None, (entry[1] if entry else "not computed") or "not computed")

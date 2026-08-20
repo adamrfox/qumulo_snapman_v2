@@ -152,6 +152,9 @@ export default function InspectDetail() {
     // three-way engine instead of a plain pairwise diff (see
     // deletion_estimate.py). Label it distinctly rather than as a pair.
     targetId?: number; targetName?: string; targetDate?: string
+    // Set only for a multi-snapshot, left-bounded run -- routed to the
+    // run-exclusive engine (see deletion_estimate.py).
+    deletedIds?: number[]
   }>>({})
   const estimateEsRef = useRef<EventSource | null>(null)
   const [showDeleteSelectedModal, setShowDeleteSelectedModal] = useState(false)
@@ -658,6 +661,23 @@ export default function InspectDetail() {
             setActiveEstimatePairs(prev => {
               const next = { ...prev }
               delete next[`t-${msg.older_id}-${msg.target_id}-${msg.newer_id}`]
+              return next
+            })
+            break
+          case 'multi_start':
+            setActiveEstimatePairs(prev => ({
+              ...prev,
+              [`m-${msg.left_id}-${msg.right_id}`]: {
+                olderId: msg.left_id, olderName: msg.left_name, olderDate: msg.left_date,
+                newerId: msg.right_id, newerName: msg.right_name, newerDate: msg.right_date,
+                deletedIds: msg.deleted_ids,
+              },
+            }))
+            break
+          case 'multi_done':
+            setActiveEstimatePairs(prev => {
+              const next = { ...prev }
+              delete next[`m-${msg.left_id}-${msg.right_id}`]
               return next
             })
             break
@@ -1207,9 +1227,11 @@ export default function InspectDetail() {
                   {Object.values(activeEstimatePairs).length > 0 && (
                     <ul className="mt-1 space-y-1">
                       {Object.values(activeEstimatePairs).map(p => (
-                        <li key={`${p.olderId}-${p.targetId ?? ''}-${p.newerId}`} className="font-mono">
+                        <li key={`${p.olderId}-${p.targetId ?? p.deletedIds?.join(',') ?? ''}-${p.newerId}`} className="font-mono">
                           {p.targetId !== undefined
                             ? <>measuring snap {p.targetId} "{p.targetName}" ({p.targetDate}) exclusive of snap {p.olderId} and snap {p.newerId}</>
+                            : p.deletedIds !== undefined
+                            ? <>measuring snaps {p.deletedIds.join(', ')} exclusive of snap {p.olderId} and snap {p.newerId}</>
                             : <>measuring snap {p.olderId} "{p.olderName}" ({p.olderDate}) → snap {p.newerId} "{p.newerName}" ({p.newerDate})</>}
                         </li>
                       ))}
