@@ -133,17 +133,29 @@ def _scan_hop(
 
 
 def _discover_candidates(
-    client: Client, chain: list[Snapshot], state: _ScanState
+    client: Client, chain: list[Snapshot], state: _ScanState, *, max_workers: int = 16
 ) -> dict[str, _Cand]:
     k = len(chain) - 2  # number of deleted snapshots
-    hop_files: list[dict[str, DiffOp]] = []
-    hop_created_dirs: list[list[str]] = []
-    hop_deleted_dirs: list[list[str]] = []
-    for i in range(k + 1):
-        files, created, deleted = _scan_hop(client, chain[i + 1].id, chain[i].id, state)
-        hop_files.append(files)
-        hop_created_dirs.append(created)
-        hop_deleted_dirs.append(deleted)
+
+    # Each hop's tree-diff scan is independent of every other hop's -- fire
+    # them off concurrently instead of waiting on one before starting the
+    # next. This was the single biggest avoidable cost for a long run (many
+    # deleted snapshots): with k+1 hops to scan serially, wall-clock time
+    # scaled with the run's length even though nothing about the scans
+    # actually depends on each other.
+    scan_ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, k + 1))
+    try:
+        futures = [
+            scan_ex.submit(_scan_hop, client, chain[i + 1].id, chain[i].id, state)
+            for i in range(k + 1)
+        ]
+        hop_results = [fut.result() for fut in futures]
+    finally:
+        scan_ex.shutdown(wait=False, cancel_futures=True)
+
+    hop_files: list[dict[str, DiffOp]] = [r[0] for r in hop_results]
+    hop_created_dirs: list[list[str]] = [r[1] for r in hop_results]
+    hop_deleted_dirs: list[list[str]] = [r[2] for r in hop_results]
 
     candidates: dict[str, _Cand] = {}
     for j in range(k + 1):
@@ -276,7 +288,9 @@ def compute_run_exclusive_contribution(
         )
 
     state = _ScanState(progress, should_stop)
-    candidates = sorted(_discover_candidates(client, chain, state).values(), key=lambda c: c.path)
+    candidates = sorted(
+        _discover_candidates(client, chain, state, max_workers=max_workers).values(), key=lambda c: c.path
+    )
     progress.enumeration_done()
 
     if not candidates:
