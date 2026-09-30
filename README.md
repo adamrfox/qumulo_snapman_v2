@@ -1,7 +1,7 @@
 # snapman-v2
 
 A multi-user, web-based tool for analyzing and reclaiming space consumed by Qumulo
-snapshots, for clusters running **Qumulo Core 7.9.0+** (the "post-9.7" snapshot
+snapshots, for clusters running **Qumulo Core 7.9.0+** (the "post-7.9" snapshot
 model).
 
 ## Why this exists
